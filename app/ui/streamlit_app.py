@@ -1,14 +1,13 @@
 import streamlit as st
 from sqlalchemy.orm import Session
 
-from app.cache import research_redis_cache
 from app.cache.redis_client import get_redis_client
 from app.config.settings import get_settings, validate_required_keys
 from app.core import auth_service
+from app.core import research_pipeline
 from app.core.intent_router import route_user_message
-from app.core.research_service import compile_report, generate_questions, research_one_question
+from app.core.pipeline_policy import stages_for_intent
 from app.core.resilience import PipelineMetrics, RetryPolicy
-from app.db import research_repository
 from app.db.session import SessionLocal
 from app.integrations.llm_client import build_llm
 
@@ -43,6 +42,7 @@ def init_session_state() -> None:
     st.session_state.setdefault("routed_intent", "")
     st.session_state.setdefault("last_router_message", "")
     st.session_state.setdefault("bypass_questions_cache", False)
+    st.session_state.setdefault("pipeline_last_error", "")
 
 
 def render_auth_sidebar() -> None:
@@ -67,6 +67,7 @@ def render_auth_sidebar() -> None:
                 "routed_intent",
                 "last_router_message",
                 "bypass_questions_cache",
+                "pipeline_last_error",
             ):
                 st.session_state.pop(k, None)
             st.rerun()
@@ -171,17 +172,23 @@ def render_research_app() -> None:
 
     st.header("Research request")
     st.text_area(
-        "用自然语言描述你的需求（解析后将填入下方主题/领域，可自行修改）",
+        "用自然语言描述你的需求（路由后按意图一键执行：出题 / 调研 / 报告）",
         key="user_request",
         height=120,
         placeholder=(
-            "例如：我想调研美国关税对半导体供应链的影响，领域为国际贸易与产业政策，需要联网资料。"
+            "例如：请对「美国关税对半导体供应链影响」做完整深度调研，领域为国际贸易与产业政策，需要联网。"
         ),
     )
-    if st.button("解析意图", key="route_intent"):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.text_input("Research topic（可编辑，路由会预填）", key="research_topic")
+    with c2:
+        st.text_input("Domain（可编辑）", key="research_domain")
+
+    if st.button("一键执行（路由 + 流水线）", type="primary", key="one_shot_run"):
         raw = (st.session_state.get("user_request") or "").strip()
         if not raw:
-            st.warning("请先输入一段话。")
+            st.warning("请先输入需求描述。")
         else:
             ctx = {
                 "research_topic": (st.session_state.get("research_topic") or "").strip(),
@@ -189,253 +196,156 @@ def render_research_app() -> None:
                 "has_questions": bool(st.session_state.get("questions")),
                 "has_answers": bool(st.session_state.get("question_answers")),
             }
-            with st.spinner("路由中..."):
+            with st.spinner("意图路由..."):
                 decision, _ = route_user_message(llm, raw, ctx, retry_policy, pipeline_metrics)
 
             st.session_state.routed_intent = decision.intent
             st.session_state.use_web_search = decision.need_web_search
             st.session_state.last_router_message = decision.reply_to_user or ""
 
-            if decision.intent == "off_topic":
-                st.info(decision.reply_to_user or "当前对话与深度调研无关。")
-            elif decision.intent == "clarify":
-                st.warning(decision.clarify_prompt or decision.reply_to_user or "信息不足，请补充。")
+            if decision.intent in ("off_topic", "clarify"):
+                st.session_state.pipeline_last_error = ""
+                if decision.intent == "off_topic":
+                    st.info(decision.reply_to_user or "当前对话与深度调研无关。")
+                else:
+                    st.warning(
+                        decision.clarify_prompt
+                        or decision.reply_to_user
+                        or "信息不足，请补充主题与领域。"
+                    )
             else:
                 if decision.topic:
                     st.session_state.research_topic = decision.topic
                 if decision.domain:
                     st.session_state.research_domain = decision.domain
-                if decision.intent == "regenerate_questions":
-                    st.session_state.bypass_questions_cache = True
-                if decision.reply_to_user:
-                    st.success(decision.reply_to_user)
-                st.success(
-                    f"意图：**{decision.intent}** ｜ 联网搜索：**"
-                    f"{'开' if decision.need_web_search else '关'}**"
+
+                topic = (st.session_state.get("research_topic") or "").strip()
+                domain = (st.session_state.get("research_domain") or "").strip()
+                stages = stages_for_intent(decision.intent)
+                force_new = decision.intent == "regenerate_questions" or bool(
+                    st.session_state.get("bypass_questions_cache")
                 )
 
-            if decision.intent == "report_only" and st.session_state.get("question_answers"):
-                st.info("已识别为「仅生成报告」。若有调研结果，请点击 **Compile Final Report**。")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.text_input("Research topic（可编辑）", key="research_topic")
-    with c2:
-        st.text_input("Domain（可编辑）", key="research_domain")
-
-    topic = (st.session_state.get("research_topic") or "").strip()
-    domain = (st.session_state.get("research_domain") or "").strip()
-
-    force_new_questions = bool(st.session_state.get("bypass_questions_cache")) or (
-        st.session_state.get("routed_intent") == "regenerate_questions"
-    )
-    with st.spinner("🤖 Generating research questions..."):
-        uid = int(st.session_state["user_id"])
-        if force_new_questions:
-            print("生成问题...")
-            old_qids = list(st.session_state.get("research_question_ids") or [])
-            research_redis_cache.delete_questions_bundle(uid, topic, domain)
-            for qid in old_qids:
-                research_redis_cache.delete_answer(int(qid))
-            print(
-                f"regenerate_questions: 已删除 Redis 问题包与 {len(old_qids)} 条答案缓存 "
-                f"topic={topic!r}, domain={domain!r}"
-            )
-        rq = (
-            None
-            if force_new_questions
-            else research_redis_cache.try_get_questions_bundle(uid, topic, domain)
-        )
-        if rq is not None:
-            questions, q_ids, run_id = rq
-            print(
-                f"在 Redis 缓存中找到信息 key={research_redis_cache.questions_key(uid, topic, domain)!r}, "
-                f"run_id={run_id}, topic={topic!r}, domain={domain!r}, "
-                f"共 {len(questions)} 条问题，此操作无需调用api"
-            )
-            st.session_state.questions = questions
-            st.session_state.research_question_ids = q_ids
-            st.session_state.research_run_id = run_id
-            st.session_state.question_answers = []
-            st.session_state.report_content = ""
-            st.session_state.research_complete = False
-        else:
-            db = _db()
-            try:
-                cached = (
-                    None
-                    if force_new_questions
-                    else research_repository.try_get_cached_questions(db, uid, topic, domain)
+                tavily_effective = (
+                    (tavily_key or None)
+                    if st.session_state.get("use_web_search", True)
+                    else None
                 )
-                if cached is not None:
-                    questions, q_ids, run_id = cached
-                    print(
-                        f"在数据库 research_question 表中找到信息 "
-                        f"run_id={run_id}, topic={topic!r}, domain={domain!r}, "
-                        f"共 {len(questions)} 条问题，此操作无需调用api"
-                    )
-                    st.session_state.questions = questions
-                    st.session_state.research_question_ids = q_ids
-                    st.session_state.research_run_id = run_id
-                    st.session_state.question_answers = []
-                    st.session_state.report_content = ""
-                    st.session_state.research_complete = False
-                    research_redis_cache.set_questions_bundle(
-                        uid,
-                        topic,
-                        domain,
-                        run_id,
-                        questions,
-                        q_ids,
-                        settings.redis_ttl_questions_seconds,
-                    )
+
+                if decision.intent == "report_only" and not st.session_state.get("question_answers"):
+                    st.error("当前没有调研结果，无法只生成报告。请先执行含「调研」的意图。")
+                elif not stages:
+                    st.warning("该意图无可执行阶段。")
+                elif not topic or not domain:
+                    st.error("缺少主题或领域，请补充后再试。")
                 else:
-                    run = research_repository.create_research_run(
-                        db, uid, topic, domain, settings.deepseek_model_id
-                    )
-                    db.commit()
-                    db.refresh(run)
+                    uid = int(st.session_state["user_id"])
+                    old_qids = [int(x) for x in (st.session_state.get("research_question_ids") or [])]
+                    db = _db()
+                    err: str | None = None
+                    questions: list[str] = []
+                    q_ids: list[int] = []
+                    run_id: int = 0
+                    question_answers: list[dict] = list(st.session_state.get("question_answers") or [])
 
-                    questions, q_outcome = generate_questions(
-                        llm, topic, domain, retry_policy, pipeline_metrics
-                    )
-                    q_ids = research_repository.save_questions_for_run(db, int(run.id), questions)
-                    db.commit()
+                    try:
+                        for stage in stages:
+                            if stage == "questions":
+                                qres = research_pipeline.run_questions_phase(
+                                    db,
+                                    uid,
+                                    topic,
+                                    domain,
+                                    force_new=force_new,
+                                    llm=llm,
+                                    settings=settings,
+                                    retry_policy=retry_policy,
+                                    metrics=pipeline_metrics,
+                                    old_question_ids=old_qids,
+                                )
+                                if len(qres) == 4:
+                                    err = str(qres[3])
+                                    break
+                                questions, q_ids, run_id = qres[0], qres[1], qres[2]
+                                st.session_state.questions = questions
+                                st.session_state.research_question_ids = q_ids
+                                st.session_state.research_run_id = run_id
+                                st.session_state.question_answers = []
+                                st.session_state.report_content = ""
+                                st.session_state.research_complete = False
 
-                    st.session_state.questions = questions
-                    st.session_state.research_question_ids = q_ids
-                    st.session_state.research_run_id = int(run.id)
-                    st.session_state.question_answers = []
-                    st.session_state.report_content = ""
-                    st.session_state.research_complete = False
+                            elif stage == "research":
+                                if not questions or not q_ids or not run_id:
+                                    err = "缺少问题列表或 run，无法调研。"
+                                    break
+                                question_answers, err = research_pipeline.run_research_phase(
+                                    db,
+                                    llm=llm,
+                                    topic=topic,
+                                    domain=domain,
+                                    questions=questions,
+                                    q_ids=q_ids,
+                                    run_id=run_id,
+                                    retry_policy=retry_policy,
+                                    metrics=pipeline_metrics,
+                                    tavily_api_key=tavily_effective,
+                                    settings=settings,
+                                )
+                                if err:
+                                    break
+                                st.session_state.question_answers = question_answers
 
-                    research_redis_cache.set_questions_bundle(
-                        uid,
-                        topic,
-                        domain,
-                        int(run.id),
-                        questions,
-                        q_ids,
-                        settings.redis_ttl_questions_seconds,
-                    )
+                            elif stage == "report":
+                                qa = list(st.session_state.get("question_answers") or question_answers)
+                                if not qa:
+                                    err = "没有 Q&A，无法生成报告。"
+                                    break
+                                report, err = research_pipeline.run_report_phase(
+                                    llm,
+                                    topic,
+                                    domain,
+                                    qa,
+                                    retry_policy,
+                                    pipeline_metrics,
+                                )
+                                if err:
+                                    break
+                                st.session_state.report_content = report
+                                st.session_state.research_complete = True
 
-                    with st.expander("Diagnostics: question generation", expanded=False):
-                        st.write(f"attempts={q_outcome.attempts}, retries={q_outcome.retry_count}")
-                        for r in q_outcome.records:
-                            st.write(r)
-                if force_new_questions:
-                    st.session_state.bypass_questions_cache = False
-                    st.session_state.routed_intent = ""
-            except Exception as e:
-                st.error(f"generate_questions failed: {e}")
-            finally:
-                db.close()
+                        st.session_state.pipeline_last_error = err or ""
+                        st.session_state.bypass_questions_cache = False
+                        st.session_state.routed_intent = ""
+
+                        if err:
+                            st.error(f"流水线中断：{err}")
+                        else:
+                            st.success(f"完成。意图={decision.intent}，执行阶段={stages}")
+                            if decision.reply_to_user:
+                                st.caption(decision.reply_to_user)
+                    finally:
+                        db.close()
+
+    if st.session_state.get("pipeline_last_error"):
+        with st.expander("上次流水线错误", expanded=False):
+            st.code(st.session_state.pipeline_last_error)
+
+    if st.session_state.get("routed_intent") or st.session_state.get("last_router_message"):
+        with st.expander("上次路由摘要", expanded=False):
+            st.write(f"intent: {st.session_state.get('routed_intent', '')}")
+            st.write(st.session_state.get("last_router_message", ""))
 
     if st.session_state.questions:
         st.header("Research Questions")
         for i, question in enumerate(st.session_state.questions):
             st.markdown(f"**{i + 1}. {question}**")
 
-    topic = (st.session_state.get("research_topic") or "").strip()
-    domain = (st.session_state.get("research_domain") or "").strip()
-    tavily_effective = (tavily_key or None) if st.session_state.get("use_web_search", True) else None
-
-    if st.session_state.questions and st.button("Start Research", key="start_research"):
+    if st.session_state.get("question_answers"):
         st.header("Research Results")
-        progress_bar = st.progress(0.0)
-
-        run_id = st.session_state.get("research_run_id")
-        qid_list = st.session_state.get("research_question_ids") or []
-
-        if run_id is None or len(qid_list) != len(st.session_state.questions):
-            st.error("缺少 research_run / question_id，请先重新生成问题。")
-        elif not topic or not domain:
-            st.error("缺少主题或领域，请先解析意图或填写 Research topic / Domain。")
-        else:
-            db = _db()
-            question_answers: list[dict] = []
-            try:
-                for i, question in enumerate(st.session_state.questions):
-                    progress_bar.progress(i / len(st.session_state.questions))
-                    answer: str | None = None
-                    qid = int(qid_list[i])
-                    with st.spinner(f"🔍 Researching question {i + 1}..."):
-                        answer = research_redis_cache.try_get_answer(qid)
-                        if answer is not None:
-                            print(
-                                f"在 Redis 缓存中找到信息 key={research_redis_cache.answer_key(qid)!r}, "
-                                f"question_id={qid}, run_id={run_id}，此操作无需调用api"
-                            )
-                        else:
-                            cached_ans = research_repository.try_get_cached_answer(db, qid)
-                            if cached_ans is not None:
-                                print(
-                                    f"在数据库 research_answer 表中找到信息 "
-                                    f"question_id={qid}, run_id={run_id}，此操作无需调用api"
-                                )
-                                answer = cached_ans
-                                research_redis_cache.set_answer(
-                                    qid,
-                                    answer,
-                                    settings.redis_ttl_answer_seconds,
-                                )
-                            else:
-                                try:
-                                    answer, _ = research_one_question(
-                                        llm,
-                                        topic,
-                                        domain,
-                                        question,
-                                        retry_policy,
-                                        pipeline_metrics,
-                                        tavily_api_key=tavily_effective,
-                                    )
-                                    research_repository.save_answer(db, int(run_id), qid, answer)
-                                    db.commit()
-                                    research_redis_cache.set_answer(
-                                        qid,
-                                        answer,
-                                        settings.redis_ttl_answer_seconds,
-                                    )
-                                except Exception as e:
-                                    st.error(f"research_one_question failed: {e}")
-
-                    st.subheader(f"Question {i + 1}:")
-                    st.markdown(f"**{question}**")
-                    if answer is not None:
-                        st.markdown(answer)
-                        question_answers.append({"question": question, "answer": answer})
-                    progress_bar.progress((i + 1) / len(st.session_state.questions))
-
-                st.session_state.question_answers = question_answers
-                st.session_state.research_complete = False
-                st.session_state.report_content = ""
-            except Exception as e:
-                st.error(f"research failed: {e}")
-            finally:
-                db.close()
-
-    topic = (st.session_state.get("research_topic") or "").strip()
-    domain = (st.session_state.get("research_domain") or "").strip()
-
-    if st.session_state.question_answers and st.button("Compile Final Report", key="compile_report"):
-        if not topic or not domain:
-            st.error("缺少主题或领域，请先解析意图或填写 Research topic / Domain。")
-        else:
-            with st.spinner("📝 Compiling final report..."):
-                try:
-                    report, _ = compile_report(
-                        llm,
-                        topic,
-                        domain,
-                        st.session_state.question_answers,
-                        retry_policy,
-                        pipeline_metrics,
-                    )
-                    st.session_state.report_content = report
-                    st.session_state.research_complete = True
-                except Exception as e:
-                    st.error(f"compile_report failed: {e}")
+        for i, qa in enumerate(st.session_state.question_answers):
+            st.subheader(f"Question {i + 1}")
+            st.markdown(f"**{qa['question']}**")
+            st.markdown(qa.get("answer", ""))
 
     if st.session_state.research_complete and st.session_state.report_content:
         st.header("Final Report")

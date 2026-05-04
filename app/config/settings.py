@@ -24,6 +24,8 @@ class Settings:
     redis_ttl_answer_seconds: int = 86400
     tavily_api_key: str = ""
 
+    a2a_coordinator_port: int = 9999
+
 
 def get_settings() -> Settings:
     return Settings(
@@ -40,6 +42,7 @@ def get_settings() -> Settings:
         redis_ttl_questions_seconds=int(os.getenv("REDIS_TTL_QUESTIONS_SECONDS", "86400")),
         redis_ttl_answer_seconds=int(os.getenv("REDIS_TTL_ANSWER_SECONDS", "86400")),
         tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
+        a2a_coordinator_port=int(os.getenv("A2A_COORDINATOR_PORT", "9999")),
     )
 
 
