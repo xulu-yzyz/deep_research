@@ -1,0 +1,14 @@
+
+langchain>=0.3.18
+langchain-core>=0.3.18
+langchain-openai>=0.2.8
+langchain-community>=0.3.0
+streamlit
+sqlalchemy>=2.0
+pymysql
+bcrypt
+redis
+python-dotenv
+langchain-classic>=1.0.0
+langchain-tavily 
+langgraph
