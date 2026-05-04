@@ -92,3 +92,22 @@ def set_answer(question_id: int, answer_text: str, ttl_seconds: int) -> None:
         r.setex(answer_key(question_id), ttl_seconds, payload)
     except Exception:
         pass
+
+def delete_questions_bundle(user_id: int, topic: str, domain: str) -> None:
+    r = get_redis_client()
+    if r is None:
+        return
+    try:
+        r.delete(questions_key(user_id, topic, domain))
+    except Exception:
+        pass
+
+
+def delete_answer(question_id: int) -> None:
+    r = get_redis_client()
+    if r is None:
+        return
+    try:
+        r.delete(answer_key(question_id))
+    except Exception:
+        pass

@@ -226,92 +226,110 @@ def render_research_app() -> None:
     topic = (st.session_state.get("research_topic") or "").strip()
     domain = (st.session_state.get("research_domain") or "").strip()
 
-    if topic and domain and st.button("Generate Research Questions", key="generate_questions"):
-        bypass = bool(st.session_state.get("bypass_questions_cache"))
-        with st.spinner("🤖 Generating research questions..."):
-            uid = int(st.session_state["user_id"])
-            rq = None if bypass else research_redis_cache.try_get_questions_bundle(uid, topic, domain)
-            if rq is not None:
-                questions, q_ids, run_id = rq
-                print(
-                    f"在 Redis 缓存中找到信息 key={research_redis_cache.questions_key(uid, topic, domain)!r}, "
-                    f"run_id={run_id}, topic={topic!r}, domain={domain!r}, "
-                    f"共 {len(questions)} 条问题，此操作无需调用api"
+    force_new_questions = bool(st.session_state.get("bypass_questions_cache")) or (
+        st.session_state.get("routed_intent") == "regenerate_questions"
+    )
+    with st.spinner("🤖 Generating research questions..."):
+        uid = int(st.session_state["user_id"])
+        if force_new_questions:
+            print("生成问题...")
+            old_qids = list(st.session_state.get("research_question_ids") or [])
+            research_redis_cache.delete_questions_bundle(uid, topic, domain)
+            for qid in old_qids:
+                research_redis_cache.delete_answer(int(qid))
+            print(
+                f"regenerate_questions: 已删除 Redis 问题包与 {len(old_qids)} 条答案缓存 "
+                f"topic={topic!r}, domain={domain!r}"
+            )
+        rq = (
+            None
+            if force_new_questions
+            else research_redis_cache.try_get_questions_bundle(uid, topic, domain)
+        )
+        if rq is not None:
+            questions, q_ids, run_id = rq
+            print(
+                f"在 Redis 缓存中找到信息 key={research_redis_cache.questions_key(uid, topic, domain)!r}, "
+                f"run_id={run_id}, topic={topic!r}, domain={domain!r}, "
+                f"共 {len(questions)} 条问题，此操作无需调用api"
+            )
+            st.session_state.questions = questions
+            st.session_state.research_question_ids = q_ids
+            st.session_state.research_run_id = run_id
+            st.session_state.question_answers = []
+            st.session_state.report_content = ""
+            st.session_state.research_complete = False
+        else:
+            db = _db()
+            try:
+                cached = (
+                    None
+                    if force_new_questions
+                    else research_repository.try_get_cached_questions(db, uid, topic, domain)
                 )
-                st.session_state.questions = questions
-                st.session_state.research_question_ids = q_ids
-                st.session_state.research_run_id = run_id
-                st.session_state.question_answers = []
-                st.session_state.report_content = ""
-                st.session_state.research_complete = False
-            else:
-                db = _db()
-                try:
-                    cached = None if bypass else research_repository.try_get_cached_questions(
-                        db, uid, topic, domain
+                if cached is not None:
+                    questions, q_ids, run_id = cached
+                    print(
+                        f"在数据库 research_question 表中找到信息 "
+                        f"run_id={run_id}, topic={topic!r}, domain={domain!r}, "
+                        f"共 {len(questions)} 条问题，此操作无需调用api"
                     )
-                    if cached is not None:
-                        questions, q_ids, run_id = cached
-                        print(
-                            f"在数据库 research_question 表中找到信息 "
-                            f"run_id={run_id}, topic={topic!r}, domain={domain!r}, "
-                            f"共 {len(questions)} 条问题，此操作无需调用api"
-                        )
-                        st.session_state.questions = questions
-                        st.session_state.research_question_ids = q_ids
-                        st.session_state.research_run_id = run_id
-                        st.session_state.question_answers = []
-                        st.session_state.report_content = ""
-                        st.session_state.research_complete = False
-                        research_redis_cache.set_questions_bundle(
-                            uid,
-                            topic,
-                            domain,
-                            run_id,
-                            questions,
-                            q_ids,
-                            settings.redis_ttl_questions_seconds,
-                        )
-                    else:
-                        run = research_repository.create_research_run(
-                            db, uid, topic, domain, settings.deepseek_model_id
-                        )
-                        db.commit()
-                        db.refresh(run)
+                    st.session_state.questions = questions
+                    st.session_state.research_question_ids = q_ids
+                    st.session_state.research_run_id = run_id
+                    st.session_state.question_answers = []
+                    st.session_state.report_content = ""
+                    st.session_state.research_complete = False
+                    research_redis_cache.set_questions_bundle(
+                        uid,
+                        topic,
+                        domain,
+                        run_id,
+                        questions,
+                        q_ids,
+                        settings.redis_ttl_questions_seconds,
+                    )
+                else:
+                    run = research_repository.create_research_run(
+                        db, uid, topic, domain, settings.deepseek_model_id
+                    )
+                    db.commit()
+                    db.refresh(run)
 
-                        questions, q_outcome = generate_questions(
-                            llm, topic, domain, retry_policy, pipeline_metrics
-                        )
-                        q_ids = research_repository.save_questions_for_run(db, int(run.id), questions)
-                        db.commit()
+                    questions, q_outcome = generate_questions(
+                        llm, topic, domain, retry_policy, pipeline_metrics
+                    )
+                    q_ids = research_repository.save_questions_for_run(db, int(run.id), questions)
+                    db.commit()
 
-                        st.session_state.questions = questions
-                        st.session_state.research_question_ids = q_ids
-                        st.session_state.research_run_id = int(run.id)
-                        st.session_state.question_answers = []
-                        st.session_state.report_content = ""
-                        st.session_state.research_complete = False
+                    st.session_state.questions = questions
+                    st.session_state.research_question_ids = q_ids
+                    st.session_state.research_run_id = int(run.id)
+                    st.session_state.question_answers = []
+                    st.session_state.report_content = ""
+                    st.session_state.research_complete = False
 
-                        research_redis_cache.set_questions_bundle(
-                            uid,
-                            topic,
-                            domain,
-                            int(run.id),
-                            questions,
-                            q_ids,
-                            settings.redis_ttl_questions_seconds,
-                        )
+                    research_redis_cache.set_questions_bundle(
+                        uid,
+                        topic,
+                        domain,
+                        int(run.id),
+                        questions,
+                        q_ids,
+                        settings.redis_ttl_questions_seconds,
+                    )
 
-                        with st.expander("Diagnostics: question generation", expanded=False):
-                            st.write(f"attempts={q_outcome.attempts}, retries={q_outcome.retry_count}")
-                            for r in q_outcome.records:
-                                st.write(r)
-                    if bypass:
-                        st.session_state.bypass_questions_cache = False
-                except Exception as e:
-                    st.error(f"generate_questions failed: {e}")
-                finally:
-                    db.close()
+                    with st.expander("Diagnostics: question generation", expanded=False):
+                        st.write(f"attempts={q_outcome.attempts}, retries={q_outcome.retry_count}")
+                        for r in q_outcome.records:
+                            st.write(r)
+                if force_new_questions:
+                    st.session_state.bypass_questions_cache = False
+                    st.session_state.routed_intent = ""
+            except Exception as e:
+                st.error(f"generate_questions failed: {e}")
+            finally:
+                db.close()
 
     if st.session_state.questions:
         st.header("Research Questions")
