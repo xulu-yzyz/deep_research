@@ -1,3 +1,5 @@
+import asyncio
+import json
 import streamlit as st
 from sqlalchemy.orm import Session
 
@@ -10,6 +12,16 @@ from app.core.pipeline_policy import stages_for_intent
 from app.core.resilience import PipelineMetrics, RetryPolicy
 from app.db.session import SessionLocal
 from app.integrations.llm_client import build_llm
+
+try:
+    import httpx
+    from a2a.client import A2ACardResolver, ClientConfig, create_client
+    from a2a.helpers import get_stream_response_text, new_text_message
+    from a2a.types.a2a_pb2 import Role, SendMessageRequest
+
+    _A2A_AVAILABLE = True
+except ImportError:
+    _A2A_AVAILABLE = False
 
 
 def _db() -> Session:
@@ -43,6 +55,43 @@ def init_session_state() -> None:
     st.session_state.setdefault("last_router_message", "")
     st.session_state.setdefault("bypass_questions_cache", False)
     st.session_state.setdefault("pipeline_last_error", "")
+    st.session_state.setdefault("use_a2a_coordinator", False)
+    st.session_state.setdefault("a2a_base_url", "http://127.0.0.1:9999")
+
+
+async def _a2a_call_pipeline(base_url: str, payload: dict) -> dict:
+    """通过 A2A JSON-RPC 调用 Coordinator，返回解析后的 JSON dict。"""
+    import httpx
+    from a2a.client import A2ACardResolver, ClientConfig, create_client
+    from a2a.helpers import get_stream_response_text, new_text_message
+    from a2a.types.a2a_pb2 import Role, SendMessageRequest
+
+    text = json.dumps(payload, ensure_ascii=False)
+    base = base_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as httpx_client:
+        resolver = A2ACardResolver(httpx_client=httpx_client, base_url=base)
+        public_card = await resolver.get_agent_card()
+        cfg = ClientConfig(streaming=False)
+        client = await create_client(agent=public_card, client_config=cfg)
+        message = new_text_message(text, role=Role.ROLE_USER)
+        request = SendMessageRequest(message=message)
+        parts: list[str] = []
+        try:
+            async for resp in client.send_message(request):
+                chunk = get_stream_response_text(resp).strip()
+                if chunk:
+                    parts.append(chunk)
+        finally:
+            await client.close()
+
+    combined = "\n".join(parts).strip()
+    if not combined:
+        raise RuntimeError("A2A 响应为空")
+    return json.loads(combined)
+
+
+def _run_pipeline_via_a2a_sync(base_url: str, payload: dict) -> dict:
+    return asyncio.run(_a2a_call_pipeline(base_url, payload))
 
 
 def render_auth_sidebar() -> None:
@@ -68,6 +117,8 @@ def render_auth_sidebar() -> None:
                 "last_router_message",
                 "bypass_questions_cache",
                 "pipeline_last_error",
+                "use_a2a_coordinator",
+                "a2a_base_url",
             ):
                 st.session_state.pop(k, None)
             st.rerun()
@@ -150,6 +201,22 @@ def render_research_app() -> None:
     )
     redis_ok = get_redis_client() is not None
     st.sidebar.caption(f"Redis cache: {'connected' if redis_ok else 'off / unavailable'}")
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### A2A (Google Agent2Agent)")
+    if not _A2A_AVAILABLE:
+        st.sidebar.warning("未安装 `a2a-sdk` / `httpx`，无法使用 A2A。`pip install \"a2a-sdk[http-server]\" httpx`")
+        st.session_state.use_a2a_coordinator = False
+    else:
+        st.sidebar.checkbox(
+            "经 A2A Coordinator 执行流水线（须单独启动 Coordinator 服务）",
+            key="use_a2a_coordinator",
+        )
+        st.sidebar.text_input(
+            "A2A Coordinator Base URL",
+            key="a2a_base_url",
+            help="例如 http://127.0.0.1:9999，需暴露 Agent Card 与 JSON-RPC",
+        )
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### About")
@@ -241,90 +308,129 @@ def render_research_app() -> None:
                 else:
                     uid = int(st.session_state["user_id"])
                     old_qids = [int(x) for x in (st.session_state.get("research_question_ids") or [])]
-                    db = _db()
+                    use_a2a = bool(st.session_state.get("use_a2a_coordinator")) and _A2A_AVAILABLE
+                    a2a_url = (st.session_state.get("a2a_base_url") or "").strip()
+
                     err: str | None = None
-                    questions: list[str] = []
-                    q_ids: list[int] = []
-                    run_id: int = 0
-                    question_answers: list[dict] = list(st.session_state.get("question_answers") or [])
 
-                    try:
-                        for stage in stages:
-                            if stage == "questions":
-                                qres = research_pipeline.run_questions_phase(
-                                    db,
-                                    uid,
-                                    topic,
-                                    domain,
-                                    force_new=force_new,
-                                    llm=llm,
-                                    settings=settings,
-                                    retry_policy=retry_policy,
-                                    metrics=pipeline_metrics,
-                                    old_question_ids=old_qids,
-                                )
-                                if len(qres) == 4:
-                                    err = str(qres[3])
-                                    break
-                                questions, q_ids, run_id = qres[0], qres[1], qres[2]
-                                st.session_state.questions = questions
-                                st.session_state.research_question_ids = q_ids
-                                st.session_state.research_run_id = run_id
-                                st.session_state.question_answers = []
-                                st.session_state.report_content = ""
-                                st.session_state.research_complete = False
-
-                            elif stage == "research":
-                                if not questions or not q_ids or not run_id:
-                                    err = "缺少问题列表或 run，无法调研。"
-                                    break
-                                question_answers, err = research_pipeline.run_research_phase(
-                                    db,
-                                    llm=llm,
-                                    topic=topic,
-                                    domain=domain,
-                                    questions=questions,
-                                    q_ids=q_ids,
-                                    run_id=run_id,
-                                    retry_policy=retry_policy,
-                                    metrics=pipeline_metrics,
-                                    tavily_api_key=tavily_effective,
-                                    settings=settings,
-                                )
-                                if err:
-                                    break
-                                st.session_state.question_answers = question_answers
-
-                            elif stage == "report":
-                                qa = list(st.session_state.get("question_answers") or question_answers)
-                                if not qa:
-                                    err = "没有 Q&A，无法生成报告。"
-                                    break
-                                report, err = research_pipeline.run_report_phase(
-                                    llm,
-                                    topic,
-                                    domain,
-                                    qa,
-                                    retry_policy,
-                                    pipeline_metrics,
-                                )
-                                if err:
-                                    break
-                                st.session_state.report_content = report
-                                st.session_state.research_complete = True
-
-                        st.session_state.pipeline_last_error = err or ""
-                        st.session_state.bypass_questions_cache = False
-                        st.session_state.routed_intent = ""
-
-                        if err:
-                            st.error(f"流水线中断：{err}")
+                    if use_a2a:
+                        if not a2a_url:
+                            err = "已启用 A2A，但未填写 Coordinator Base URL。"
                         else:
-                            st.success(f"完成。意图={decision.intent}，执行阶段={stages}")
-                            if decision.reply_to_user:
-                                st.caption(decision.reply_to_user)
-                    finally:
-                        db.close()
+                            try:
+                                with st.spinner("通过 A2A 调用 Coordinator…"):
+                                    payload = {
+                                        "uid": uid,
+                                        "topic": topic,
+                                        "domain": domain,
+                                        "stages": stages,
+                                        "force_new": force_new,
+                                        "old_question_ids": old_qids,
+                                        "tavily_api_key": tavily_effective,
+                                    }
+                                    data = _run_pipeline_via_a2a_sync(a2a_url, payload)
+                                err = data.get("error")
+                                if not err:
+                                    st.session_state.questions = list(data.get("questions") or [])
+                                    st.session_state.research_question_ids = [
+                                        int(x) for x in (data.get("question_ids") or [])
+                                    ]
+                                    rid = data.get("run_id")
+                                    st.session_state.research_run_id = int(rid) if rid is not None else None
+                                    st.session_state.question_answers = list(
+                                        data.get("question_answers") or []
+                                    )
+                                    st.session_state.report_content = str(data.get("report") or "")
+                                    st.session_state.research_complete = bool(
+                                        data.get("research_complete")
+                                    )
+                            except Exception as e:
+                                err = f"A2A 调用失败: {e}"
+                    else:
+                        db = _db()
+                        questions: list[str] = []
+                        q_ids: list[int] = []
+                        run_id: int = 0
+                        question_answers: list[dict] = list(st.session_state.get("question_answers") or [])
+
+                        try:
+                            for stage in stages:
+                                if stage == "questions":
+                                    qres = research_pipeline.run_questions_phase(
+                                        db,
+                                        uid,
+                                        topic,
+                                        domain,
+                                        force_new=force_new,
+                                        llm=llm,
+                                        settings=settings,
+                                        retry_policy=retry_policy,
+                                        metrics=pipeline_metrics,
+                                        old_question_ids=old_qids,
+                                    )
+                                    if len(qres) == 4:
+                                        err = str(qres[3])
+                                        break
+                                    questions, q_ids, run_id = qres[0], qres[1], qres[2]
+                                    st.session_state.questions = questions
+                                    st.session_state.research_question_ids = q_ids
+                                    st.session_state.research_run_id = run_id
+                                    st.session_state.question_answers = []
+                                    st.session_state.report_content = ""
+                                    st.session_state.research_complete = False
+
+                                elif stage == "research":
+                                    if not questions or not q_ids or not run_id:
+                                        err = "缺少问题列表或 run，无法调研。"
+                                        break
+                                    question_answers, err = research_pipeline.run_research_phase(
+                                        db,
+                                        llm=llm,
+                                        topic=topic,
+                                        domain=domain,
+                                        questions=questions,
+                                        q_ids=q_ids,
+                                        run_id=run_id,
+                                        retry_policy=retry_policy,
+                                        metrics=pipeline_metrics,
+                                        tavily_api_key=tavily_effective,
+                                        settings=settings,
+                                    )
+                                    if err:
+                                        break
+                                    st.session_state.question_answers = question_answers
+
+                                elif stage == "report":
+                                    qa = list(st.session_state.get("question_answers") or question_answers)
+                                    if not qa:
+                                        err = "没有 Q&A，无法生成报告。"
+                                        break
+                                    report, err = research_pipeline.run_report_phase(
+                                        llm,
+                                        topic,
+                                        domain,
+                                        qa,
+                                        retry_policy,
+                                        pipeline_metrics,
+                                    )
+                                    if err:
+                                        break
+                                    st.session_state.report_content = report
+                                    st.session_state.research_complete = True
+                        finally:
+                            db.close()
+
+                    st.session_state.pipeline_last_error = err or ""
+                    st.session_state.bypass_questions_cache = False
+                    st.session_state.routed_intent = ""
+
+                    if err:
+                        st.error(f"流水线中断：{err}")
+                    else:
+                        mode = "A2A" if use_a2a else "in-process"
+                        st.success(f"完成（{mode}）。意图={decision.intent}，执行阶段={stages}")
+                        if decision.reply_to_user:
+                            st.caption(decision.reply_to_user)
 
     if st.session_state.get("pipeline_last_error"):
         with st.expander("上次流水线错误", expanded=False):
@@ -370,3 +476,7 @@ def render_streamlit_app() -> None:
 
     render_auth_sidebar()
     render_research_app()
+
+
+if __name__ == "__main__":
+    render_streamlit_app()
