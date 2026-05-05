@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from langchain_openai import ChatOpenAI
 from sqlalchemy.orm import Session
 
@@ -17,11 +19,12 @@ def run_questions_phase(
     domain: str,
     *,
     force_new: bool,
-    llm: ChatOpenAI,
+    llm: ChatOpenAI | None,
     settings: Settings,
     retry_policy: RetryPolicy,
     metrics: PipelineMetrics,
     old_question_ids: list[int],
+    question_list_provider: Callable[[str, str], list[str]] | None = None,
 ) -> tuple[list[str], list[int], int] | tuple[None, None, None, str]:
     topic, domain = topic.strip(), domain.strip()
     if not topic or not domain:
@@ -57,7 +60,12 @@ def run_questions_phase(
         )
         db.commit()
         db.refresh(run)
-        questions, _ = generate_questions(llm, topic, domain, retry_policy, metrics)
+        if question_list_provider is not None:
+            questions = question_list_provider(topic, domain)
+        else:
+            if llm is None:
+                return None, None, None, "未提供 LLM 或 question_list_provider，无法生成问题。"
+            questions, _ = generate_questions(llm, topic, domain, retry_policy, metrics)
         q_ids = research_repository.save_questions_for_run(db, int(run.id), questions)
         db.commit()
         research_redis_cache.set_questions_bundle(
@@ -77,7 +85,7 @@ def run_questions_phase(
 def run_research_phase(
     db: Session,
     *,
-    llm: ChatOpenAI,
+    llm: ChatOpenAI | None,
     topic: str,
     domain: str,
     questions: list[str],
@@ -87,6 +95,7 @@ def run_research_phase(
     metrics: PipelineMetrics,
     tavily_api_key: str | None,
     settings: Settings,
+    answer_provider: Callable[[str, str, str], str] | None = None,
 ) -> tuple[list[dict], str | None]:
     if len(q_ids) != len(questions):
         return [], "question_id 与问题条数不一致。"
@@ -103,15 +112,20 @@ def run_research_phase(
                 )
         if answer is None:
             try:
-                answer, _ = research_one_question(
-                    llm,
-                    topic,
-                    domain,
-                    question,
-                    retry_policy,
-                    metrics,
-                    tavily_api_key=tavily_api_key,
-                )
+                if answer_provider is not None:
+                    answer = answer_provider(topic, domain, question)
+                else:
+                    if llm is None:
+                        return [], "未提供 LLM 或 answer_provider，无法调研。"
+                    answer, _ = research_one_question(
+                        llm,
+                        topic,
+                        domain,
+                        question,
+                        retry_policy,
+                        metrics,
+                        tavily_api_key=tavily_api_key,
+                    )
                 research_repository.save_answer(db, int(run_id), qid, answer)
                 db.commit()
                 research_redis_cache.set_answer(
@@ -124,17 +138,23 @@ def run_research_phase(
 
 
 def run_report_phase(
-    llm: ChatOpenAI,
+    llm: ChatOpenAI | None,
     topic: str,
     domain: str,
     question_answers: list[dict],
     retry_policy: RetryPolicy,
     metrics: PipelineMetrics,
+    report_provider: Callable[[str, str, list[dict]], str] | None = None,
 ) -> tuple[str, str | None]:
     try:
-        report, _ = compile_report(
-            llm, topic, domain, question_answers, retry_policy, metrics
-        )
+        if report_provider is not None:
+            report = report_provider(topic, domain, question_answers)
+        else:
+            if llm is None:
+                return "", "未提供 LLM 或 report_provider，无法生成报告。"
+            report, _ = compile_report(
+                llm, topic, domain, question_answers, retry_policy, metrics
+            )
         return report, None
     except Exception as e:
         return "", str(e)

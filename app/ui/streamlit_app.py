@@ -13,16 +13,23 @@ from app.core.resilience import PipelineMetrics, RetryPolicy
 from app.db.session import SessionLocal
 from app.integrations.llm_client import build_llm
 
-try:
-    import httpx
-    from a2a.client import A2ACardResolver, ClientConfig, create_client
-    from a2a.helpers import get_stream_response_text, new_text_message
-    from a2a.types.a2a_pb2 import Role, SendMessageRequest
 
+# try:
+#     from app.a2a.a2a_json_client import send_json_message
+
+#     _A2A_AVAILABLE = True
+# except ImportError:
+#     _A2A_AVAILABLE = False
+
+try:
+    import httpx  # noqa: F401
+    from app.a2a.a2a_json_client import send_json_message
     _A2A_AVAILABLE = True
 except ImportError:
     _A2A_AVAILABLE = False
 
+
+settings = get_settings()
 
 def _db() -> Session:
     return SessionLocal()
@@ -55,43 +62,16 @@ def init_session_state() -> None:
     st.session_state.setdefault("last_router_message", "")
     st.session_state.setdefault("bypass_questions_cache", False)
     st.session_state.setdefault("pipeline_last_error", "")
-    st.session_state.setdefault("use_a2a_coordinator", False)
-    st.session_state.setdefault("a2a_base_url", "http://127.0.0.1:9999")
+    st.session_state.setdefault("use_a2a_orchestrator", False)
+    st.session_state.setdefault("a2a_base_url", f"http://127.0.0.1:{settings.a2a_orchestrator_port}")
 
 
-async def _a2a_call_pipeline(base_url: str, payload: dict) -> dict:
-    """通过 A2A JSON-RPC 调用 Coordinator，返回解析后的 JSON dict。"""
-    import httpx
-    from a2a.client import A2ACardResolver, ClientConfig, create_client
-    from a2a.helpers import get_stream_response_text, new_text_message
-    from a2a.types.a2a_pb2 import Role, SendMessageRequest
-
-    text = json.dumps(payload, ensure_ascii=False)
-    base = base_url.rstrip("/")
-    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as httpx_client:
-        resolver = A2ACardResolver(httpx_client=httpx_client, base_url=base)
-        public_card = await resolver.get_agent_card()
-        cfg = ClientConfig(streaming=False)
-        client = await create_client(agent=public_card, client_config=cfg)
-        message = new_text_message(text, role=Role.ROLE_USER)
-        request = SendMessageRequest(message=message)
-        parts: list[str] = []
-        try:
-            async for resp in client.send_message(request):
-                chunk = get_stream_response_text(resp).strip()
-                if chunk:
-                    parts.append(chunk)
-        finally:
-            await client.close()
-
-    combined = "\n".join(parts).strip()
-    if not combined:
-        raise RuntimeError("A2A 响应为空")
-    return json.loads(combined)
+async def _call_orchestrator(base_url: str, payload: dict) -> dict:
+    return await send_json_message(base_url.rstrip("/"), payload)
 
 
-def _run_pipeline_via_a2a_sync(base_url: str, payload: dict) -> dict:
-    return asyncio.run(_a2a_call_pipeline(base_url, payload))
+def _run_orchestrator_via_a2a_sync(base_url: str, payload: dict) -> dict:
+    return asyncio.run(_call_orchestrator(base_url, payload))
 
 
 def render_auth_sidebar() -> None:
@@ -112,12 +92,14 @@ def render_auth_sidebar() -> None:
                 "user_request",
                 "research_topic",
                 "research_domain",
+                "_pending_research_topic",
+                "_pending_research_domain",
                 "use_web_search",
                 "routed_intent",
                 "last_router_message",
                 "bypass_questions_cache",
                 "pipeline_last_error",
-                "use_a2a_coordinator",
+                "use_a2a_orchestrator",
                 "a2a_base_url",
             ):
                 st.session_state.pop(k, None)
@@ -178,7 +160,13 @@ def render_login_register() -> None:
 
 
 def render_research_app() -> None:
-    settings = get_settings()
+    # Router may pre-fill topic/domain; apply before widgets bind to these keys.
+    if "_pending_research_topic" in st.session_state:
+        st.session_state["research_topic"] = st.session_state.pop("_pending_research_topic")
+    if "_pending_research_domain" in st.session_state:
+        st.session_state["research_domain"] = st.session_state.pop("_pending_research_domain")
+
+    
     retry_policy = RetryPolicy(
         timeout_seconds=settings.request_timeout_seconds,
         max_retries=settings.max_retries,
@@ -203,19 +191,20 @@ def render_research_app() -> None:
     st.sidebar.caption(f"Redis cache: {'connected' if redis_ok else 'off / unavailable'}")
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### A2A (Google Agent2Agent)")
+    st.sidebar.markdown("### A2A (Orchestrator)")
     if not _A2A_AVAILABLE:
-        st.sidebar.warning("未安装 `a2a-sdk` / `httpx`，无法使用 A2A。`pip install \"a2a-sdk[http-server]\" httpx`")
-        st.session_state.use_a2a_coordinator = False
-    else:
-        st.sidebar.checkbox(
-            "经 A2A Coordinator 执行流水线（须单独启动 Coordinator 服务）",
-            key="use_a2a_coordinator",
+        st.sidebar.warning(
+            "未安装依赖。请安装: pip install \"a2a-sdk[http-server]\" httpx"
         )
+        st.session_state.use_a2a_orchestrator = False
+    else:
+        st.session_state.use_a2a_orchestrator = True
+
         st.sidebar.text_input(
-            "A2A Coordinator Base URL",
+            "Orchestrator Base URL",
             key="a2a_base_url",
-            help="例如 http://127.0.0.1:9999，需暴露 Agent Card 与 JSON-RPC",
+            value=f"http://127.0.0.1:{settings.a2a_orchestrator_port}",
+            help="与 settings.a2a_orchestrator_port 一致",
         )
 
     st.sidebar.markdown("---")
@@ -252,7 +241,7 @@ def render_research_app() -> None:
     with c2:
         st.text_input("Domain（可编辑）", key="research_domain")
 
-    if st.button("一键执行（路由 + 流水线）", type="primary", key="one_shot_run"):
+    if st.button("一键执行", type="primary", key="one_shot_run"):
         raw = (st.session_state.get("user_request") or "").strip()
         if not raw:
             st.warning("请先输入需求描述。")
@@ -281,13 +270,18 @@ def render_research_app() -> None:
                         or "信息不足，请补充主题与领域。"
                     )
             else:
-                if decision.topic:
-                    st.session_state.research_topic = decision.topic
-                if decision.domain:
-                    st.session_state.research_domain = decision.domain
-
                 topic = (st.session_state.get("research_topic") or "").strip()
                 domain = (st.session_state.get("research_domain") or "").strip()
+                if decision.topic:
+                    t = (decision.topic or "").strip()
+                    if t:
+                        topic = t
+                    st.session_state["_pending_research_topic"] = topic
+                if decision.domain:
+                    d = (decision.domain or "").strip()
+                    if d:
+                        domain = d
+                    st.session_state["_pending_research_domain"] = domain
                 stages = stages_for_intent(decision.intent)
                 force_new = decision.intent == "regenerate_questions" or bool(
                     st.session_state.get("bypass_questions_cache")
@@ -308,17 +302,17 @@ def render_research_app() -> None:
                 else:
                     uid = int(st.session_state["user_id"])
                     old_qids = [int(x) for x in (st.session_state.get("research_question_ids") or [])]
-                    use_a2a = bool(st.session_state.get("use_a2a_coordinator")) and _A2A_AVAILABLE
+                    use_a2a = bool(st.session_state.get("use_a2a_orchestrator")) and _A2A_AVAILABLE
                     a2a_url = (st.session_state.get("a2a_base_url") or "").strip()
 
                     err: str | None = None
 
                     if use_a2a:
                         if not a2a_url:
-                            err = "已启用 A2A，但未填写 Coordinator Base URL。"
+                            err = "已启用 A2A，但未填写 Orchestrator Base URL。"
                         else:
                             try:
-                                with st.spinner("通过 A2A 调用 Coordinator…"):
+                                with st.spinner("通过 A2A 调用 Orchestrator…"):
                                     payload = {
                                         "uid": uid,
                                         "topic": topic,
@@ -328,7 +322,7 @@ def render_research_app() -> None:
                                         "old_question_ids": old_qids,
                                         "tavily_api_key": tavily_effective,
                                     }
-                                    data = _run_pipeline_via_a2a_sync(a2a_url, payload)
+                                    data = _run_orchestrator_via_a2a_sync(a2a_url, payload)
                                 err = data.get("error")
                                 if not err:
                                     st.session_state.questions = list(data.get("questions") or [])
@@ -427,7 +421,7 @@ def render_research_app() -> None:
                     if err:
                         st.error(f"流水线中断：{err}")
                     else:
-                        mode = "A2A" if use_a2a else "in-process"
+                        mode = "A2A-Orchestrator" if use_a2a else "in-process"
                         st.success(f"完成（{mode}）。意图={decision.intent}，执行阶段={stages}")
                         if decision.reply_to_user:
                             st.caption(decision.reply_to_user)

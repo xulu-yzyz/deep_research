@@ -20,7 +20,7 @@ Answer the following research question about topic '{topic}' in domain '{domain}
 
 {question}
 
-Use search tool first when there is a need. Then accoriding to the result, answer the question.
+Don't use search tool more than once. Then accoriding to the result, answer the question.
 """.strip()
 
 

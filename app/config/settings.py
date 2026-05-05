@@ -24,7 +24,11 @@ class Settings:
     redis_ttl_answer_seconds: int = 86400
     tavily_api_key: str = ""
 
-    a2a_coordinator_port: int = 9999
+    # a2a_coordinator_port: int = 9999
+    a2a_orchestrator_port: int = 10000
+    a2a_question_port: int = 9997
+    a2a_research_port: int = 9998
+    a2a_report_port: int = 9999
 
 
 def get_settings() -> Settings:
@@ -42,7 +46,11 @@ def get_settings() -> Settings:
         redis_ttl_questions_seconds=int(os.getenv("REDIS_TTL_QUESTIONS_SECONDS", "86400")),
         redis_ttl_answer_seconds=int(os.getenv("REDIS_TTL_ANSWER_SECONDS", "86400")),
         tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
-        a2a_coordinator_port=int(os.getenv("A2A_COORDINATOR_PORT", "9999")),
+        # a2a_coordinator_port=int(os.getenv("A2A_COORDINATOR_PORT", "9999")),
+        a2a_orchestrator_port=int(os.getenv("A2A_ORCHESTRATOR_PORT", "10001")),
+        a2a_question_port=int(os.getenv("A2A_QUESTION_PORT", "9997")),
+        a2a_research_port=int(os.getenv("A2A_RESEARCH_PORT", "9998")),
+        a2a_report_port=int(os.getenv("A2A_REPORT_PORT", "9999")),
     )
 
 
