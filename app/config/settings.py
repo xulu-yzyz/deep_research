@@ -30,6 +30,13 @@ class Settings:
     a2a_research_port: int = 9998
     a2a_report_port: int = 9999
 
+    # STM：意图路由上下文预算（为模型回复与安全余量预留 token）
+    stm_router_context_limit: int = 64000
+    stm_router_reserved_output_tokens: int = 2048
+    stm_router_buffer_tokens: int = 1024
+
+    _STM_HARD_MAX_TURNS : int = 2000
+
 
 def get_settings() -> Settings:
     return Settings(
@@ -51,6 +58,10 @@ def get_settings() -> Settings:
         a2a_question_port=int(os.getenv("A2A_QUESTION_PORT", "9997")),
         a2a_research_port=int(os.getenv("A2A_RESEARCH_PORT", "9998")),
         a2a_report_port=int(os.getenv("A2A_REPORT_PORT", "9999")),
+        stm_router_context_limit=int(os.getenv("STM_ROUTER_CONTEXT_LIMIT", "64000")),
+        stm_router_reserved_output_tokens=int(os.getenv("STM_ROUTER_RESERVED_OUTPUT_TOKENS", "2048")),
+        stm_router_buffer_tokens=int(os.getenv("STM_ROUTER_BUFFER_TOKENS", "1024")),
+        _STM_HARD_MAX_TURNS=int(os.getenv("STM_HARD_MAX_TURNS", "2000")),
     )
 
 

@@ -62,7 +62,16 @@ def decision_from_payload(data: dict[str, Any], session_context: dict[str, Any])
     prev_topic = str(session_context.get("research_topic", "")).strip()
     prev_domain = str(session_context.get("research_domain", "")).strip()
 
+
+
     if intent in ("regenerate_questions", "report_only"):
+        if not topic:
+            topic = prev_topic
+        if not domain:
+            domain = prev_domain
+    
+    # STM-1: 用户只改「领域」或只改「主题」时，模型可能只填一侧；用会话快照补全另一侧。
+    if intent == "full_research":
         if not topic:
             topic = prev_topic
         if not domain:

@@ -12,7 +12,7 @@ from app.core.pipeline_policy import stages_for_intent
 from app.core.resilience import PipelineMetrics, RetryPolicy
 from app.db.session import SessionLocal
 from app.integrations.llm_client import build_llm
-
+from app.core.stm_router_context import prepare_stm_router_context
 
 # try:
 #     from app.a2a.a2a_json_client import send_json_message
@@ -31,8 +31,30 @@ except ImportError:
 
 settings = get_settings()
 
+# STM-1：会话内多轮改口（仅保留最近若干条，控制 token）
+STM_MAX_TURNS = 10
+
+
 def _db() -> Session:
     return SessionLocal()
+
+
+_STM_HARD_MAX_TURNS = settings._STM_HARD_MAX_TURNS
+def _trim_stm_turns(turns: list) -> None:
+    while len(turns) > _STM_HARD_MAX_TURNS:
+        turns.pop(0)
+
+
+def _append_stm_turn(role: str, content: str) -> None:
+    c = (content or "").strip()
+    if not c:
+        return
+    turns: list = st.session_state.setdefault("chat_turns", [])
+    turns.append({"role": role, "content": c})
+    _trim_stm_turns(turns)
+
+
+
 
 
 def init_session_state() -> None:
@@ -64,6 +86,8 @@ def init_session_state() -> None:
     st.session_state.setdefault("pipeline_last_error", "")
     st.session_state.setdefault("use_a2a_orchestrator", False)
     st.session_state.setdefault("a2a_base_url", f"http://127.0.0.1:{settings.a2a_orchestrator_port}")
+    st.session_state.setdefault("chat_turns", [])
+    st.session_state.setdefault("stm_dialogue_summary", "")
 
 
 async def _call_orchestrator(base_url: str, payload: dict) -> dict:
@@ -88,6 +112,7 @@ def render_auth_sidebar() -> None:
             st.session_state.research_complete = False
             st.session_state.research_run_id = None
             st.session_state.research_question_ids = []
+            st.session_state.chat_turns = []
             for k in (
                 "user_request",
                 "research_topic",
@@ -101,6 +126,7 @@ def render_auth_sidebar() -> None:
                 "pipeline_last_error",
                 "use_a2a_orchestrator",
                 "a2a_base_url",
+                "stm_dialogue_summary",
             ):
                 st.session_state.pop(k, None)
             st.rerun()
@@ -166,7 +192,6 @@ def render_research_app() -> None:
     if "_pending_research_domain" in st.session_state:
         st.session_state["research_domain"] = st.session_state.pop("_pending_research_domain")
 
-    
     retry_policy = RetryPolicy(
         timeout_seconds=settings.request_timeout_seconds,
         max_retries=settings.max_retries,
@@ -246,12 +271,27 @@ def render_research_app() -> None:
         if not raw:
             st.warning("请先输入需求描述。")
         else:
-            ctx = {
+            _append_stm_turn("user", raw)
+            turns: list = st.session_state.setdefault("chat_turns", [])
+            summ = str(st.session_state.get("stm_dialogue_summary") or "")
+            base_snap = {
                 "research_topic": (st.session_state.get("research_topic") or "").strip(),
                 "research_domain": (st.session_state.get("research_domain") or "").strip(),
                 "has_questions": bool(st.session_state.get("questions")),
                 "has_answers": bool(st.session_state.get("question_answers")),
             }
+            # 压缩对话历史，准备意图路由上下文
+            ctx, summ2 = prepare_stm_router_context(
+                llm=llm,
+                user_text=raw,
+                base_snapshot=base_snap,
+                chat_turns=turns,
+                dialogue_summary=summ,
+                settings=settings,
+                retry_policy=retry_policy,
+                metrics=pipeline_metrics,
+            )
+            st.session_state["stm_dialogue_summary"] = summ2
             with st.spinner("意图路由..."):
                 decision, _ = route_user_message(llm, raw, ctx, retry_policy, pipeline_metrics)
 
@@ -261,6 +301,13 @@ def render_research_app() -> None:
 
             if decision.intent in ("off_topic", "clarify"):
                 st.session_state.pipeline_last_error = ""
+                assist = (
+                    decision.reply_to_user
+                    or decision.clarify_prompt
+                    or ("信息不足，请补充主题与领域。" if decision.intent == "clarify" else "")
+                ).strip()
+                if assist:
+                    _append_stm_turn("assistant", assist)
                 if decision.intent == "off_topic":
                     st.info(decision.reply_to_user or "当前对话与深度调研无关。")
                 else:
@@ -282,6 +329,15 @@ def render_research_app() -> None:
                     if d:
                         domain = d
                     st.session_state["_pending_research_domain"] = domain
+
+                assist_lines: list[str] = []
+                if (decision.reply_to_user or "").strip():
+                    assist_lines.append(decision.reply_to_user.strip())
+                assist_lines.append(
+                    f"[路由] 主题: {topic or '(空)'}；领域: {domain or '(空)'}；意图: {decision.intent}"
+                )
+                _append_stm_turn("assistant", "\n".join(assist_lines))
+
                 stages = stages_for_intent(decision.intent)
                 force_new = decision.intent == "regenerate_questions" or bool(
                     st.session_state.get("bypass_questions_cache")
