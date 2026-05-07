@@ -3,7 +3,10 @@ from __future__ import annotations
 from sqlalchemy import select, desc, exists
 from sqlalchemy.orm import Session
 
-from app.db.models import ResearchAnswer, ResearchQuestion, ResearchRun
+from app.db.models import ResearchAnswer, ResearchQuestion, ResearchRun, ResearchReport
+from dataclasses import dataclass
+from sqlalchemy import select, desc
+from sqlalchemy.orm import Session
 
 
 def find_latest_run_with_questions(
@@ -101,3 +104,109 @@ def save_answer(db: Session, run_id: int, question_id: int, answer_text: str) ->
     run = db.get(ResearchRun, run_id)
     if run is not None and run.status == "questions_ready":
         run.status = "researching"
+
+@dataclass
+class RunSummary:
+    run_id: int
+    topic: str
+    domain: str
+    status: str
+    updated_at: object  # datetime
+def list_recent_runs(db: Session, user_id: int, limit: int = 20) -> list[RunSummary]:
+    rows = db.scalars(
+        select(ResearchRun)
+        .where(ResearchRun.user_id == int(user_id))
+        .order_by(desc(ResearchRun.updated_at), desc(ResearchRun.id))
+        .limit(int(limit))
+    ).all()
+    out: list[RunSummary] = []
+    for r in rows:
+        out.append(
+            RunSummary(
+                run_id=int(r.id),
+                topic=str(r.topic),
+                domain=str(r.domain),
+                status=str(r.status),
+                updated_at=r.updated_at,
+            )
+        )
+    return out
+def load_answers_for_run(db: Session, run_id: int) -> dict[int, str]:
+    """返回 {question_id: answer_text}"""
+    rows = db.scalars(
+        select(ResearchAnswer)
+        .where(ResearchAnswer.run_id == int(run_id))
+        .order_by(ResearchAnswer.question_id.asc())
+    ).all()
+    return {int(r.question_id): str(r.answer_text) for r in rows}
+    
+def load_run_bundle(db: Session, user_id: int, run_id: int) -> dict:
+    """恢复整次会话用：topic/domain/questions/qids/qa（report 可选）"""
+    run = db.get(ResearchRun, int(run_id))
+    if run is None:
+        raise ValueError("run_id not found")
+    if int(run.user_id) != int(user_id):
+        raise ValueError("forbidden: run does not belong to user")
+    # questions + qids（你已有 load_questions_from_db 也行；这里直接查模型）
+    qrows = db.scalars(
+        select(ResearchQuestion)
+        .where(ResearchQuestion.run_id == int(run_id))
+        .order_by(ResearchQuestion.ordinal.asc())
+    ).all()
+    questions = [str(q.question_text) for q in qrows]
+    qids = [int(q.id) for q in qrows]
+    ans_map = load_answers_for_run(db, int(run_id))
+
+    rep = load_report_for_run(db, int(run_id))
+    report_body = rep[0] if rep else ""
+    report_format = rep[1] if rep else "markdown"
+
+    qa = []
+    for q, qid in zip(questions, qids):
+        a = ans_map.get(int(qid))
+        if a is not None:
+            qa.append({"question": q, "answer": a})
+    return {
+        "run_id": int(run.id),
+        "topic": str(run.topic),
+        "domain": str(run.domain),
+        "status": str(run.status),
+        "questions": questions,
+        "question_ids": qids,
+        "question_answers": qa,
+        "report": report_body,
+        "report_format": report_format,  # 与 streamlit_app.py 展示结构一致
+        # "report": None,  # 若你后续把 report ORM/写入补上，这里再加
+    }
+
+
+def upsert_report(
+    db: Session,
+    run_id: int,
+    body: str,
+    *,
+    format: str = "html",
+) -> None:
+    fmt = (format or "html").strip().lower()
+    if fmt not in ("html", "markdown"):
+        fmt = "html"
+
+    row = db.scalars(
+        select(ResearchReport).where(ResearchReport.run_id == int(run_id)).limit(1)
+    ).first()
+
+    if row is None:
+        row = ResearchReport(run_id=int(run_id), body=body, format=fmt)
+        db.add(row)
+    else:
+        row.body = body
+        row.format = fmt
+
+
+def load_report_for_run(db: Session, run_id: int) -> tuple[str, str] | None:
+    row = db.scalars(
+        select(ResearchReport).where(ResearchReport.run_id == int(run_id)).limit(1)
+    ).first()
+    if row is None:
+        return None
+    return str(row.body), str(row.format)

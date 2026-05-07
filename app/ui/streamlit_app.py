@@ -13,17 +13,12 @@ from app.core.resilience import PipelineMetrics, RetryPolicy
 from app.db.session import SessionLocal
 from app.integrations.llm_client import build_llm
 from app.core.stm_router_context import prepare_stm_router_context
-
-# try:
-#     from app.a2a.a2a_json_client import send_json_message
-
-#     _A2A_AVAILABLE = True
-# except ImportError:
-#     _A2A_AVAILABLE = False
+from app.db import research_repository
 
 try:
     import httpx  # noqa: F401
     from app.a2a.a2a_json_client import send_json_message
+
     _A2A_AVAILABLE = True
 except ImportError:
     _A2A_AVAILABLE = False
@@ -40,6 +35,8 @@ def _db() -> Session:
 
 
 _STM_HARD_MAX_TURNS = settings._STM_HARD_MAX_TURNS
+
+
 def _trim_stm_turns(turns: list) -> None:
     while len(turns) > _STM_HARD_MAX_TURNS:
         turns.pop(0)
@@ -52,9 +49,6 @@ def _append_stm_turn(role: str, content: str) -> None:
     turns: list = st.session_state.setdefault("chat_turns", [])
     turns.append({"role": role, "content": c})
     _trim_stm_turns(turns)
-
-
-
 
 
 def init_session_state() -> None:
@@ -85,7 +79,9 @@ def init_session_state() -> None:
     st.session_state.setdefault("bypass_questions_cache", False)
     st.session_state.setdefault("pipeline_last_error", "")
     st.session_state.setdefault("use_a2a_orchestrator", False)
-    st.session_state.setdefault("a2a_base_url", f"http://127.0.0.1:{settings.a2a_orchestrator_port}")
+    st.session_state.setdefault(
+        "a2a_base_url", f"http://127.0.0.1:{settings.a2a_orchestrator_port}"
+    )
     st.session_state.setdefault("chat_turns", [])
     st.session_state.setdefault("stm_dialogue_summary", "")
 
@@ -101,7 +97,9 @@ def _run_orchestrator_via_a2a_sync(base_url: str, payload: dict) -> dict:
 def render_auth_sidebar() -> None:
     st.sidebar.markdown("### Account")
     if st.session_state.get("user_id") is not None:
-        label = st.session_state.get("user_display_name") or st.session_state.get("user_email")
+        label = st.session_state.get("user_display_name") or st.session_state.get(
+            "user_email"
+        )
         st.sidebar.write(f"Signed in as **{label}**")
         if st.sidebar.button("Log out", key="logout_btn"):
             for k in ("user_id", "user_email", "user_display_name"):
@@ -185,12 +183,73 @@ def render_login_register() -> None:
                     db.close()
 
 
+def _restore_run_into_session(db: Session, uid: int, run_id: int) -> None:
+    bundle = research_repository.load_run_bundle(db, uid, run_id)
+
+    st.session_state["research_run_id"] = int(bundle["run_id"])
+    st.session_state["research_topic"] = str(bundle["topic"])
+    st.session_state["research_domain"] = str(bundle["domain"])
+    st.session_state["questions"] = list(bundle.get("questions") or [])
+    st.session_state["research_question_ids"] = [
+        int(x) for x in (bundle.get("question_ids") or [])
+    ]
+    st.session_state["question_answers"] = list(bundle.get("question_answers") or [])
+
+    st.session_state["report_content"] = str(bundle.get("report") or "")
+    st.session_state["research_complete"] = bool(st.session_state["report_content"])
+
+
+def _render_history_restore_panel(uid: int) -> None:
+    db = _db()
+    try:
+        runs = research_repository.list_recent_runs(db, uid, limit=20)
+    finally:
+        db.close()
+
+    if not runs:
+        return
+
+    with st.expander("🧠 恢复历史调研会话", expanded=False):
+        options = {
+            f"[{r.status}] {r.topic}  /  {r.domain}  (run_id={r.run_id})": r.run_id
+            for r in runs
+        }
+        label = st.selectbox("选择一个历史会话", list(options.keys()))
+        picked_run_id = int(options[label])
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("仅回填主题/领域", key="prefill_topic_domain"):
+                db = _db()
+                try:
+                    bundle = research_repository.load_run_bundle(db, uid, picked_run_id)
+                finally:
+                    db.close()
+                st.session_state["research_topic"] = str(bundle["topic"])
+                st.session_state["research_domain"] = str(bundle["domain"])
+                st.rerun()
+
+        with c2:
+            if st.button("恢复该会话（含报告）", type="primary", key="restore_full_run"):
+                db = _db()
+                try:
+                    _restore_run_into_session(db, uid, picked_run_id)
+                finally:
+                    db.close()
+                st.success("已恢复：主题/领域、问题、答案与报告。")
+                st.rerun()
+
+
 def render_research_app() -> None:
     # Router may pre-fill topic/domain; apply before widgets bind to these keys.
     if "_pending_research_topic" in st.session_state:
-        st.session_state["research_topic"] = st.session_state.pop("_pending_research_topic")
+        st.session_state["research_topic"] = st.session_state.pop(
+            "_pending_research_topic"
+        )
     if "_pending_research_domain" in st.session_state:
-        st.session_state["research_domain"] = st.session_state.pop("_pending_research_domain")
+        st.session_state["research_domain"] = st.session_state.pop(
+            "_pending_research_domain"
+        )
 
     retry_policy = RetryPolicy(
         timeout_seconds=settings.request_timeout_seconds,
@@ -218,9 +277,7 @@ def render_research_app() -> None:
     st.sidebar.markdown("---")
     st.sidebar.markdown("### A2A (Orchestrator)")
     if not _A2A_AVAILABLE:
-        st.sidebar.warning(
-            "未安装依赖。请安装: pip install \"a2a-sdk[http-server]\" httpx"
-        )
+        st.sidebar.warning('未安装依赖。请安装: pip install "a2a-sdk[http-server]" httpx')
         st.session_state.use_a2a_orchestrator = False
     else:
         st.session_state.use_a2a_orchestrator = True
@@ -251,14 +308,16 @@ def render_research_app() -> None:
         base_url=settings.deepseek_base_url,
     )
 
+    # 历史恢复（登录用户）
+    uid = int(st.session_state["user_id"])
+    _render_history_restore_panel(uid)
+
     st.header("Research request")
     st.text_area(
         "用自然语言描述你的需求（路由后按意图一键执行：出题 / 调研 / 报告）",
         key="user_request",
         height=120,
-        placeholder=(
-            "例如：请对「美国关税对半导体供应链影响」做完整深度调研，领域为国际贸易与产业政策，需要联网。"
-        ),
+        placeholder="例如：请对「美国关税对半导体供应链影响」做完整深度调研，领域为国际贸易与产业政策，需要联网。",
     )
     c1, c2 = st.columns(2)
     with c1:
@@ -293,7 +352,9 @@ def render_research_app() -> None:
             )
             st.session_state["stm_dialogue_summary"] = summ2
             with st.spinner("意图路由..."):
-                decision, _ = route_user_message(llm, raw, ctx, retry_policy, pipeline_metrics)
+                decision, _ = route_user_message(
+                    llm, raw, ctx, retry_policy, pipeline_metrics
+                )
 
             st.session_state.routed_intent = decision.intent
             st.session_state.use_web_search = decision.need_web_search
@@ -349,16 +410,22 @@ def render_research_app() -> None:
                     else None
                 )
 
-                if decision.intent == "report_only" and not st.session_state.get("question_answers"):
+                if decision.intent == "report_only" and not st.session_state.get(
+                    "question_answers"
+                ):
                     st.error("当前没有调研结果，无法只生成报告。请先执行含「调研」的意图。")
                 elif not stages:
                     st.warning("该意图无可执行阶段。")
                 elif not topic or not domain:
                     st.error("缺少主题或领域，请补充后再试。")
                 else:
-                    uid = int(st.session_state["user_id"])
-                    old_qids = [int(x) for x in (st.session_state.get("research_question_ids") or [])]
-                    use_a2a = bool(st.session_state.get("use_a2a_orchestrator")) and _A2A_AVAILABLE
+                    old_qids = [
+                        int(x)
+                        for x in (st.session_state.get("research_question_ids") or [])
+                    ]
+                    use_a2a = bool(
+                        st.session_state.get("use_a2a_orchestrator")
+                    ) and _A2A_AVAILABLE
                     a2a_url = (st.session_state.get("a2a_base_url") or "").strip()
 
                     err: str | None = None
@@ -381,16 +448,22 @@ def render_research_app() -> None:
                                     data = _run_orchestrator_via_a2a_sync(a2a_url, payload)
                                 err = data.get("error")
                                 if not err:
-                                    st.session_state.questions = list(data.get("questions") or [])
+                                    st.session_state.questions = list(
+                                        data.get("questions") or []
+                                    )
                                     st.session_state.research_question_ids = [
                                         int(x) for x in (data.get("question_ids") or [])
                                     ]
                                     rid = data.get("run_id")
-                                    st.session_state.research_run_id = int(rid) if rid is not None else None
+                                    st.session_state.research_run_id = (
+                                        int(rid) if rid is not None else None
+                                    )
                                     st.session_state.question_answers = list(
                                         data.get("question_answers") or []
                                     )
-                                    st.session_state.report_content = str(data.get("report") or "")
+                                    st.session_state.report_content = str(
+                                        data.get("report") or ""
+                                    )
                                     st.session_state.research_complete = bool(
                                         data.get("research_complete")
                                     )
@@ -401,7 +474,9 @@ def render_research_app() -> None:
                         questions: list[str] = []
                         q_ids: list[int] = []
                         run_id: int = 0
-                        question_answers: list[dict] = list(st.session_state.get("question_answers") or [])
+                        question_answers: list[dict] = list(
+                            st.session_state.get("question_answers") or []
+                        )
 
                         try:
                             for stage in stages:
@@ -451,7 +526,10 @@ def render_research_app() -> None:
                                     st.session_state.question_answers = question_answers
 
                                 elif stage == "report":
-                                    qa = list(st.session_state.get("question_answers") or question_answers)
+                                    qa = list(
+                                        st.session_state.get("question_answers")
+                                        or question_answers
+                                    )
                                     if not qa:
                                         err = "没有 Q&A，无法生成报告。"
                                         break
@@ -465,6 +543,20 @@ def render_research_app() -> None:
                                     )
                                     if err:
                                         break
+
+                                    # 关键：写入 research_report（需要你在 repo 中实现 upsert_report）
+                                    try:
+                                        research_repository.upsert_report(
+                                            db,
+                                            int(run_id),
+                                            str(report),
+                                            format="markdown",
+                                        )
+                                        db.commit()
+                                    except Exception as e:
+                                        err = f"报告写入数据库失败: {e}"
+                                        break
+
                                     st.session_state.report_content = report
                                     st.session_state.research_complete = True
                         finally:

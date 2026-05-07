@@ -158,3 +158,40 @@ def run_report_phase(
         return report, None
     except Exception as e:
         return "", str(e)
+
+def run_report_phase_and_persist(
+    db: Session,
+    *,
+    run_id: int,
+    llm: ChatOpenAI | None,
+    topic: str,
+    domain: str,
+    question_answers: list[dict],
+    retry_policy: RetryPolicy,
+    metrics: PipelineMetrics,
+    report_format: str = "html",
+    report_provider: Callable[[str, str, list[dict]], str] | None = None,
+) -> tuple[str, str | None]:
+    report, err = run_report_phase(
+        llm,
+        topic,
+        domain,
+        question_answers,
+        retry_policy,
+        metrics,
+        report_provider=report_provider,
+    )
+    if err:
+        return "", err
+
+    try:
+        research_repository.upsert_report(db, int(run_id), report, format=report_format)
+        run = db.get(research_repository.ResearchRun, int(run_id))  # 如果你不想额外 import，可在 repo 里更新 status
+        # 更推荐：直接在 repository 提供 set_run_status(db, run_id, "done")
+        if run is not None:
+            run.status = "done"
+        db.commit()
+    except Exception as e:
+        return report, str(e)
+
+    return report, None

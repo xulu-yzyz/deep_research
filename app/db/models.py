@@ -73,3 +73,21 @@ class ResearchAnswer(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), onupdate=func.now()
     )
+
+class ResearchReport(Base):
+    __tablename__ = "research_report"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("research_run.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    format: Mapped[str] = mapped_column(
+        Enum("html", "markdown", name="report_format_enum", create_constraint=False),
+        nullable=False,
+        server_default="html",
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), server_default=func.now())
