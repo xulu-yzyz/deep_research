@@ -68,17 +68,19 @@ def compile_report(
     question_answers: list[dict],
     retry_policy: RetryPolicy,
     metrics: PipelineMetrics | None = None,
+    preferences: dict | None = None,
+    memory_context: str | None = None,
 ) -> tuple[str, RetryOutcome[str]]:
-    qa_sections = "\n".join(
-        f"<h2>{idx + 1}. {qa['question']}</h2>\n<p>{qa['answer']}</p>"
-        for idx, qa in enumerate(question_answers)
-    )
-
     def _run() -> str:
-        return _report_agent.run(model, topic, domain, question_answers)
-
+        return _report_agent.run(
+            model,
+            topic,
+            domain,
+            question_answers,
+            preferences=preferences,
+            memory_context=memory_context,
+        )
     outcome = call_with_retry("compile_report", _run, retry_policy)
     if metrics:
         metrics.add("compile_report", outcome)
-
     return outcome.value, outcome

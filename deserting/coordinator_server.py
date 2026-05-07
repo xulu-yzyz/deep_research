@@ -129,7 +129,7 @@ def _run_pipeline_blocking(payload: dict) -> dict:
                 if not qa:
                     out["error"] = "没有 Q&A，无法生成报告。"
                     break
-                report, err = research_pipeline.run_report_phase(
+                report, err = research_pipeline.run_report_phase_and_persist(
                     llm, topic, domain, qa, retry_policy, metrics
                 )
                 if err:

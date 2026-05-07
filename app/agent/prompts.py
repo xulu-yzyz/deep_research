@@ -28,9 +28,33 @@ def research_agent_user(topic: str, domain: str, question: str) -> str:
     return f"Research this question for topic={topic}, domain={domain}: {question}"
 
 
-def report_agent_system(topic: str, domain: str, qa_sections: str) -> str:
+def report_agent_system(
+    topic: str,
+    domain: str,
+    qa_sections: str,
+    preferences: dict | None = None,
+    memory_context: str | None = None,
+) -> str:
+    memory_block = ""
+    if (memory_context or "").strip():
+        memory_block = f"""
+Persistent User Memory (cross-session preferences/feedback, free-form):
+{memory_context}
+"""
+
     return f"""
-You are a sophisticated research assistant. Compile the following research findings into a professional, McKinsey-style report.
+You are a sophisticated research assistant.
+
+Priority rules:
+1) Explicit instructions in the current request
+2) Persistent user memory
+3) Your default professional judgement
+
+Use the memory as soft constraints:
+- preserve user preferred structure, wording density, evidence style, and language
+- if memories conflict, prefer newer/high-confidence memories and current request
+
+{memory_block}
 
 Report structure:
 1. Executive Summary/Introduction
@@ -45,7 +69,6 @@ Domain: {domain}
 Research Questions and Findings:
 {qa_sections}
 """.strip()
-
 
 def report_agent_user(topic: str, domain: str) -> str:
     return f"Compile final report for topic={topic}, domain={domain}"

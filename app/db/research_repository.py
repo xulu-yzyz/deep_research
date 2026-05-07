@@ -3,7 +3,13 @@ from __future__ import annotations
 from sqlalchemy import select, desc, exists
 from sqlalchemy.orm import Session
 
-from app.db.models import ResearchAnswer, ResearchQuestion, ResearchRun, ResearchReport
+from app.db.models import (
+    ResearchAnswer,
+    ResearchQuestion,
+    ResearchRun,
+    ResearchReport,
+    UserPreferenceProfile,
+)
 from dataclasses import dataclass
 from sqlalchemy import select, desc
 from sqlalchemy.orm import Session
@@ -210,3 +216,58 @@ def load_report_for_run(db: Session, run_id: int) -> tuple[str, str] | None:
     if row is None:
         return None
     return str(row.body), str(row.format)
+
+_ALLOWED_REPORT_STYLE = {"mckinsey", "academic", "investor_memo", "professional"}
+_ALLOWED_LANGUAGE = {"zh", "en"}
+_ALLOWED_TONE = {"neutral", "conservative", "decisive"}
+
+def _sanitize_preferences(prefs: dict | None) -> dict:
+    prefs = prefs or {}
+    out: dict[str, str] = {}
+
+    rs = str(prefs.get("report_style", "")).strip().lower()
+    lg = str(prefs.get("language", "")).strip().lower()
+    tn = str(prefs.get("answer_tone", "")).strip().lower()
+
+    if rs in _ALLOWED_REPORT_STYLE:
+        out["report_style"] = rs
+    if lg in _ALLOWED_LANGUAGE:
+        out["language"] = lg
+    if tn in _ALLOWED_TONE:
+        out["answer_tone"] = tn
+
+    return out
+
+
+def load_user_preferences(db: Session, user_id: int) -> dict:
+    row = db.get(UserPreferenceProfile, int(user_id))
+    if row is None:
+        return {}
+    return _sanitize_preferences(row.preferences_json)
+
+
+def upsert_user_preferences(
+    db: Session,
+    user_id: int,
+    prefs: dict,
+    *,
+    source: str = "manual",
+) -> dict:
+    clean_new = _sanitize_preferences(prefs)
+    row = db.get(UserPreferenceProfile, int(user_id))
+
+    if row is None:
+        merged = clean_new
+        row = UserPreferenceProfile(
+            user_id=int(user_id),
+            preferences_json=merged,
+            source="manual" if source not in ("manual", "inferred") else source,
+        )
+        db.add(row)
+    else:
+        old = _sanitize_preferences(row.preferences_json)
+        merged = {**old, **clean_new}
+        row.preferences_json = merged
+        row.source = "manual" if source not in ("manual", "inferred") else source
+
+    return merged

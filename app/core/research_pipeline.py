@@ -145,6 +145,8 @@ def run_report_phase(
     retry_policy: RetryPolicy,
     metrics: PipelineMetrics,
     report_provider: Callable[[str, str, list[dict]], str] | None = None,
+    preferences: dict | None = None,
+    memory_context: str | None = None,
 ) -> tuple[str, str | None]:
     try:
         if report_provider is not None:
@@ -153,7 +155,14 @@ def run_report_phase(
             if llm is None:
                 return "", "未提供 LLM 或 report_provider，无法生成报告。"
             report, _ = compile_report(
-                llm, topic, domain, question_answers, retry_policy, metrics
+                llm,
+                topic,
+                domain,
+                question_answers,
+                retry_policy,
+                metrics,
+                preferences=preferences,
+                memory_context=memory_context,
             )
         return report, None
     except Exception as e:
@@ -171,6 +180,8 @@ def run_report_phase_and_persist(
     metrics: PipelineMetrics,
     report_format: str = "html",
     report_provider: Callable[[str, str, list[dict]], str] | None = None,
+    preferences: dict | None = None,
+    memory_context: str | None = None,
 ) -> tuple[str, str | None]:
     report, err = run_report_phase(
         llm,
@@ -180,6 +191,8 @@ def run_report_phase_and_persist(
         retry_policy,
         metrics,
         report_provider=report_provider,
+        preferences=preferences,
+        memory_context=memory_context,
     )
     if err:
         return "", err

@@ -62,8 +62,6 @@ class ResearchRoleAgent(LlmRoleAgent):
 
 
 class ReportRoleAgent(LlmRoleAgent):
-    """角色 3：把多组 Q&A 合成最终报告。"""
-
     def __init__(self) -> None:
         super().__init__("ReportWriter")
 
@@ -73,14 +71,21 @@ class ReportRoleAgent(LlmRoleAgent):
         topic: str,
         domain: str,
         question_answers: list[dict],
+        preferences: dict | None = None,
+        memory_context: str | None = None,
     ) -> str:
         qa_sections = "\n".join(
             f"<h2>{idx + 1}. {qa['question']}</h2>\n<p>{qa['answer']}</p>"
             for idx, qa in enumerate(question_answers)
         )
-        system = agent_prompts.report_agent_system(topic, domain, qa_sections)
+        system = agent_prompts.report_agent_system(
+            topic,
+            domain,
+            qa_sections,
+            preferences=preferences,
+            memory_context=memory_context,
+        )
         user = agent_prompts.report_agent_user(topic, domain)
-        print("This is ReportRoleAgent")
         return self._invoke_text(llm, system, user)
 
 

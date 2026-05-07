@@ -91,3 +91,21 @@ class ResearchReport(Base):
         server_default="html",
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), server_default=func.now())
+
+class UserPreferenceProfile(Base):
+    __tablename__ = "user_preference_profile"
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    preferences_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    source: Mapped[str] = mapped_column(
+        Enum("manual", "inferred", name="preference_source_enum", create_constraint=False),
+        nullable=False,
+        server_default="manual",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), onupdate=func.now()
+    )

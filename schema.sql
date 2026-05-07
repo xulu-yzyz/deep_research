@@ -118,3 +118,15 @@ CREATE TABLE IF NOT EXISTS `research_report` (
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 COMMENT='Final compiled report for a run';
+
+CREATE TABLE IF NOT EXISTS `user_preference_profile` (
+  `user_id` BIGINT UNSIGNED NOT NULL,
+  `preferences_json` JSON NOT NULL,
+  `source` ENUM('manual', 'inferred') NOT NULL DEFAULT 'manual',
+  `updated_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (`user_id`),
+  CONSTRAINT `fk_preference_user`
+    FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='User-level long-term preferences for report generation';
