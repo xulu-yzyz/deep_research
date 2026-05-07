@@ -1,5 +1,4 @@
 import asyncio
-import json
 import streamlit as st
 from sqlalchemy.orm import Session
 
@@ -8,11 +7,10 @@ from app.config.settings import get_settings, validate_required_keys
 from app.core import auth_service
 from app.core import research_pipeline
 from app.core.intent_router import route_user_message
-from app.core.pipeline_policy import stages_for_intent
 from app.core.resilience import PipelineMetrics, RetryPolicy
+from app.core.stm_router_context import prepare_stm_router_context
 from app.db.session import SessionLocal
 from app.integrations.llm_client import build_llm
-from app.core.stm_router_context import prepare_stm_router_context
 from app.db import research_repository
 
 try:
@@ -25,16 +23,11 @@ except ImportError:
 
 
 settings = get_settings()
-
-# STM-1：会话内多轮改口（仅保留最近若干条，控制 token）
-STM_MAX_TURNS = 10
+_STM_HARD_MAX_TURNS = settings._STM_HARD_MAX_TURNS
 
 
 def _db() -> Session:
     return SessionLocal()
-
-
-_STM_HARD_MAX_TURNS = settings._STM_HARD_MAX_TURNS
 
 
 def _trim_stm_turns(turns: list) -> None:
@@ -58,18 +51,14 @@ def init_session_state() -> None:
         st.session_state.user_email = None
     if "user_display_name" not in st.session_state:
         st.session_state.user_display_name = None
-    if "questions" not in st.session_state:
-        st.session_state.questions = []
-    if "question_answers" not in st.session_state:
-        st.session_state.question_answers = []
-    if "report_content" not in st.session_state:
-        st.session_state.report_content = ""
-    if "research_complete" not in st.session_state:
-        st.session_state.research_complete = False
-    if "research_run_id" not in st.session_state:
-        st.session_state.research_run_id = None
-    if "research_question_ids" not in st.session_state:
-        st.session_state.research_question_ids = []
+
+    st.session_state.setdefault("questions", [])
+    st.session_state.setdefault("question_answers", [])
+    st.session_state.setdefault("report_content", "")
+    st.session_state.setdefault("research_complete", False)
+    st.session_state.setdefault("research_run_id", None)
+    st.session_state.setdefault("research_question_ids", [])
+
     st.session_state.setdefault("user_request", "")
     st.session_state.setdefault("research_topic", "")
     st.session_state.setdefault("research_domain", "")
@@ -85,6 +74,11 @@ def init_session_state() -> None:
     st.session_state.setdefault("chat_turns", [])
     st.session_state.setdefault("stm_dialogue_summary", "")
 
+    # New staged workflow states
+    st.session_state.setdefault("topic_domain_confirmed", False)
+    st.session_state.setdefault("questions_confirmed", False)
+    st.session_state.setdefault("answers_confirmed", False)
+
 
 async def _call_orchestrator(base_url: str, payload: dict) -> dict:
     return await send_json_message(base_url.rstrip("/"), payload)
@@ -92,6 +86,24 @@ async def _call_orchestrator(base_url: str, payload: dict) -> dict:
 
 def _run_orchestrator_via_a2a_sync(base_url: str, payload: dict) -> dict:
     return asyncio.run(_call_orchestrator(base_url, payload))
+
+
+def _reset_after_topic_change() -> None:
+    st.session_state["questions"] = []
+    st.session_state["research_question_ids"] = []
+    st.session_state["question_answers"] = []
+    st.session_state["report_content"] = ""
+    st.session_state["research_complete"] = False
+    st.session_state["research_run_id"] = None
+    st.session_state["questions_confirmed"] = False
+    st.session_state["answers_confirmed"] = False
+
+
+def _reset_after_questions_change() -> None:
+    st.session_state["question_answers"] = []
+    st.session_state["report_content"] = ""
+    st.session_state["research_complete"] = False
+    st.session_state["answers_confirmed"] = False
 
 
 def render_auth_sidebar() -> None:
@@ -104,14 +116,14 @@ def render_auth_sidebar() -> None:
         if st.sidebar.button("Log out", key="logout_btn"):
             for k in ("user_id", "user_email", "user_display_name"):
                 st.session_state.pop(k, None)
-            st.session_state.questions = []
-            st.session_state.question_answers = []
-            st.session_state.report_content = ""
-            st.session_state.research_complete = False
-            st.session_state.research_run_id = None
-            st.session_state.research_question_ids = []
-            st.session_state.chat_turns = []
             for k in (
+                "questions",
+                "question_answers",
+                "report_content",
+                "research_complete",
+                "research_run_id",
+                "research_question_ids",
+                "chat_turns",
                 "user_request",
                 "research_topic",
                 "research_domain",
@@ -125,6 +137,9 @@ def render_auth_sidebar() -> None:
                 "use_a2a_orchestrator",
                 "a2a_base_url",
                 "stm_dialogue_summary",
+                "topic_domain_confirmed",
+                "questions_confirmed",
+                "answers_confirmed",
             ):
                 st.session_state.pop(k, None)
             st.rerun()
@@ -198,6 +213,11 @@ def _restore_run_into_session(db: Session, uid: int, run_id: int) -> None:
     st.session_state["report_content"] = str(bundle.get("report") or "")
     st.session_state["research_complete"] = bool(st.session_state["report_content"])
 
+    # Workflow recovery flags
+    st.session_state["topic_domain_confirmed"] = True
+    st.session_state["questions_confirmed"] = bool(st.session_state["questions"])
+    st.session_state["answers_confirmed"] = bool(st.session_state["question_answers"])
+
 
 def _render_history_restore_panel(uid: int) -> None:
     db = _db()
@@ -227,6 +247,8 @@ def _render_history_restore_panel(uid: int) -> None:
                     db.close()
                 st.session_state["research_topic"] = str(bundle["topic"])
                 st.session_state["research_domain"] = str(bundle["domain"])
+                st.session_state["topic_domain_confirmed"] = False
+                _reset_after_topic_change()
                 st.rerun()
 
         with c2:
@@ -241,15 +263,11 @@ def _render_history_restore_panel(uid: int) -> None:
 
 
 def render_research_app() -> None:
-    # Router may pre-fill topic/domain; apply before widgets bind to these keys.
+    # Apply pending from router before widgets bind.
     if "_pending_research_topic" in st.session_state:
-        st.session_state["research_topic"] = st.session_state.pop(
-            "_pending_research_topic"
-        )
+        st.session_state["research_topic"] = st.session_state.pop("_pending_research_topic")
     if "_pending_research_domain" in st.session_state:
-        st.session_state["research_domain"] = st.session_state.pop(
-            "_pending_research_domain"
-        )
+        st.session_state["research_domain"] = st.session_state.pop("_pending_research_domain")
 
     retry_policy = RetryPolicy(
         timeout_seconds=settings.request_timeout_seconds,
@@ -275,27 +293,13 @@ def render_research_app() -> None:
     st.sidebar.caption(f"Redis cache: {'connected' if redis_ok else 'off / unavailable'}")
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### A2A (Orchestrator)")
-    if not _A2A_AVAILABLE:
-        st.sidebar.warning('未安装依赖。请安装: pip install "a2a-sdk[http-server]" httpx')
-        st.session_state.use_a2a_orchestrator = False
-    else:
-        st.session_state.use_a2a_orchestrator = True
-
-        st.sidebar.text_input(
-            "Orchestrator Base URL",
-            key="a2a_base_url",
-            value=f"http://127.0.0.1:{settings.a2a_orchestrator_port}",
-            help="与 settings.a2a_orchestrator_port 一致",
-        )
-
-    st.sidebar.markdown("---")
     st.sidebar.markdown("### About")
     st.sidebar.info(
-        "This AI DeepResearch Agent uses DeepSeek model to perform comprehensive research."
+        "Step-by-step mode: confirm topic/domain -> confirm questions -> generate answers -> confirm answers -> generate report."
     )
 
-    st.title("🔍 AI DeepResearch Agent with langchain")
+    st.title("🔍 AI DeepResearch Agent")
+    st.caption("分步确认模式（非一键执行）")
 
     valid, err_msg = validate_required_keys(deepseek_api_key)
     if not valid:
@@ -308,24 +312,18 @@ def render_research_app() -> None:
         base_url=settings.deepseek_base_url,
     )
 
-    # 历史恢复（登录用户）
     uid = int(st.session_state["user_id"])
     _render_history_restore_panel(uid)
 
-    st.header("Research request")
+    st.header("Step 0: 输入需求")
     st.text_area(
-        "用自然语言描述你的需求（路由后按意图一键执行：出题 / 调研 / 报告）",
+        "用自然语言描述需求",
         key="user_request",
         height=120,
-        placeholder="例如：请对「美国关税对半导体供应链影响」做完整深度调研，领域为国际贸易与产业政策，需要联网。",
+        placeholder="例如：请调研美国关税对半导体供应链影响，领域为国际贸易与产业政策。",
     )
-    c1, c2 = st.columns(2)
-    with c1:
-        st.text_input("Research topic（可编辑，路由会预填）", key="research_topic")
-    with c2:
-        st.text_input("Domain（可编辑）", key="research_domain")
 
-    if st.button("一键执行", type="primary", key="one_shot_run"):
+    if st.button("Step 1: 解析需求并提取 topic/domain", type="primary", key="parse_request"):
         raw = (st.session_state.get("user_request") or "").strip()
         if not raw:
             st.warning("请先输入需求描述。")
@@ -339,7 +337,7 @@ def render_research_app() -> None:
                 "has_questions": bool(st.session_state.get("questions")),
                 "has_answers": bool(st.session_state.get("question_answers")),
             }
-            # 压缩对话历史，准备意图路由上下文
+
             ctx, summ2 = prepare_stm_router_context(
                 llm=llm,
                 user_text=raw,
@@ -351,228 +349,239 @@ def render_research_app() -> None:
                 metrics=pipeline_metrics,
             )
             st.session_state["stm_dialogue_summary"] = summ2
-            with st.spinner("意图路由..."):
-                decision, _ = route_user_message(
-                    llm, raw, ctx, retry_policy, pipeline_metrics
+
+            with st.spinner("意图路由中..."):
+                decision, _ = route_user_message(llm, raw, ctx, retry_policy, pipeline_metrics)
+
+            st.session_state["routed_intent"] = decision.intent
+            st.session_state["use_web_search"] = decision.need_web_search
+            st.session_state["last_router_message"] = decision.reply_to_user or ""
+
+            if decision.intent == "off_topic":
+                st.info(decision.reply_to_user or "当前需求与深度调研无关，请重新输入。")
+            elif decision.intent == "clarify":
+                st.warning(
+                    decision.clarify_prompt
+                    or decision.reply_to_user
+                    or "信息不足，请补充主题与领域。"
                 )
-
-            st.session_state.routed_intent = decision.intent
-            st.session_state.use_web_search = decision.need_web_search
-            st.session_state.last_router_message = decision.reply_to_user or ""
-
-            if decision.intent in ("off_topic", "clarify"):
-                st.session_state.pipeline_last_error = ""
-                assist = (
-                    decision.reply_to_user
-                    or decision.clarify_prompt
-                    or ("信息不足，请补充主题与领域。" if decision.intent == "clarify" else "")
-                ).strip()
-                if assist:
-                    _append_stm_turn("assistant", assist)
-                if decision.intent == "off_topic":
-                    st.info(decision.reply_to_user or "当前对话与深度调研无关。")
-                else:
-                    st.warning(
-                        decision.clarify_prompt
-                        or decision.reply_to_user
-                        or "信息不足，请补充主题与领域。"
-                    )
             else:
-                topic = (st.session_state.get("research_topic") or "").strip()
-                domain = (st.session_state.get("research_domain") or "").strip()
                 if decision.topic:
-                    t = (decision.topic or "").strip()
-                    if t:
-                        topic = t
-                    st.session_state["_pending_research_topic"] = topic
+                    st.session_state["research_topic"] = decision.topic.strip()
                 if decision.domain:
-                    d = (decision.domain or "").strip()
-                    if d:
-                        domain = d
-                    st.session_state["_pending_research_domain"] = domain
-
-                assist_lines: list[str] = []
-                if (decision.reply_to_user or "").strip():
-                    assist_lines.append(decision.reply_to_user.strip())
-                assist_lines.append(
-                    f"[路由] 主题: {topic or '(空)'}；领域: {domain or '(空)'}；意图: {decision.intent}"
-                )
-                _append_stm_turn("assistant", "\n".join(assist_lines))
-
-                stages = stages_for_intent(decision.intent)
-                force_new = decision.intent == "regenerate_questions" or bool(
-                    st.session_state.get("bypass_questions_cache")
+                    st.session_state["research_domain"] = decision.domain.strip()
+                st.success("已提取 topic/domain，请在下一步确认。")
+                _append_stm_turn(
+                    "assistant",
+                    f"提取结果：topic={st.session_state.get('research_topic','')}, domain={st.session_state.get('research_domain','')}",
                 )
 
+            # Any new parse invalidates downstream confirmations
+            st.session_state["topic_domain_confirmed"] = False
+            _reset_after_topic_change()
+
+    st.header("Step 2: 确认 topic / domain")
+    c1, c2 = st.columns(2)
+    with c1:
+        old_topic = st.session_state.get("research_topic", "")
+        st.text_input("Research topic", key="research_topic")
+        if old_topic != st.session_state.get("research_topic", ""):
+            st.session_state["topic_domain_confirmed"] = False
+            _reset_after_topic_change()
+    with c2:
+        old_domain = st.session_state.get("research_domain", "")
+        st.text_input("Domain", key="research_domain")
+        if old_domain != st.session_state.get("research_domain", ""):
+            st.session_state["topic_domain_confirmed"] = False
+            _reset_after_topic_change()
+
+    c3, c4 = st.columns(2)
+    with c3:
+        if st.button("确认 topic/domain", key="confirm_topic_domain"):
+            topic = (st.session_state.get("research_topic") or "").strip()
+            domain = (st.session_state.get("research_domain") or "").strip()
+            if not topic or not domain:
+                st.error("请先填写完整 topic 和 domain。")
+            else:
+                st.session_state["topic_domain_confirmed"] = True
+                st.success("已确认 topic/domain。")
+    with c4:
+        if st.button("重置后续阶段", key="reset_downstream"):
+            _reset_after_topic_change()
+            st.session_state["topic_domain_confirmed"] = False
+            st.info("已重置问题、答案和报告。")
+
+    if not st.session_state.get("topic_domain_confirmed"):
+        st.info("请先确认 topic/domain，之后才能生成调查问题。")
+        return
+
+    st.header("Step 3: 生成并确认调查问题")
+    if st.button("生成调查问题", key="gen_questions_btn"):
+        db = _db()
+        topic = (st.session_state.get("research_topic") or "").strip()
+        domain = (st.session_state.get("research_domain") or "").strip()
+        force_new = True
+        old_qids = [int(x) for x in (st.session_state.get("research_question_ids") or [])]
+        try:
+            with st.spinner("生成问题中..."):
+                qres = research_pipeline.run_questions_phase(
+                    db,
+                    uid,
+                    topic,
+                    domain,
+                    force_new=force_new,
+                    llm=llm,
+                    settings=settings,
+                    retry_policy=retry_policy,
+                    metrics=pipeline_metrics,
+                    old_question_ids=old_qids,
+                )
+            if len(qres) == 4:
+                st.error(f"生成问题失败：{qres[3]}")
+            else:
+                questions, q_ids, run_id = qres[0], qres[1], qres[2]
+                st.session_state["questions"] = questions
+                st.session_state["research_question_ids"] = q_ids
+                st.session_state["research_run_id"] = run_id
+                st.session_state["questions_confirmed"] = False
+                _reset_after_questions_change()
+                st.success("问题已生成，请确认后再生成答案。")
+        finally:
+            db.close()
+
+    if st.session_state.get("questions"):
+        for i, q in enumerate(st.session_state["questions"], 1):
+            st.markdown(f"**{i}. {q}**")
+
+        c5, c6 = st.columns(2)
+        with c5:
+            if st.button("确认这些问题", key="confirm_questions_btn"):
+                st.session_state["questions_confirmed"] = True
+                st.success("问题已确认。")
+        with c6:
+            if st.button("重新生成问题", key="regen_questions_btn"):
+                st.session_state["questions_confirmed"] = False
+                _reset_after_questions_change()
+                st.info("请点击“生成调查问题”重新生成。")
+    else:
+        st.info("尚未生成问题。")
+
+    if not st.session_state.get("questions_confirmed"):
+        return
+
+    st.header("Step 4: 用户同意后生成答案")
+    if st.button("生成答案（Research）", type="primary", key="run_research_btn"):
+        db = _db()
+        try:
+            topic = (st.session_state.get("research_topic") or "").strip()
+            domain = (st.session_state.get("research_domain") or "").strip()
+            questions = list(st.session_state.get("questions") or [])
+            q_ids = [int(x) for x in (st.session_state.get("research_question_ids") or [])]
+            run_id = st.session_state.get("research_run_id")
+
+            if not questions or not q_ids or not run_id:
+                st.error("缺少问题或 run_id，无法执行调研。")
+            else:
                 tavily_effective = (
                     (tavily_key or None)
                     if st.session_state.get("use_web_search", True)
                     else None
                 )
-
-                if decision.intent == "report_only" and not st.session_state.get(
-                    "question_answers"
-                ):
-                    st.error("当前没有调研结果，无法只生成报告。请先执行含「调研」的意图。")
-                elif not stages:
-                    st.warning("该意图无可执行阶段。")
-                elif not topic or not domain:
-                    st.error("缺少主题或领域，请补充后再试。")
+                with st.spinner("调研并生成答案中..."):
+                    question_answers, err = research_pipeline.run_research_phase(
+                        db,
+                        llm=llm,
+                        topic=topic,
+                        domain=domain,
+                        questions=questions,
+                        q_ids=q_ids,
+                        run_id=int(run_id),
+                        retry_policy=retry_policy,
+                        metrics=pipeline_metrics,
+                        tavily_api_key=tavily_effective,
+                        settings=settings,
+                    )
+                if err:
+                    st.error(f"生成答案失败：{err}")
                 else:
-                    old_qids = [
-                        int(x)
-                        for x in (st.session_state.get("research_question_ids") or [])
-                    ]
-                    use_a2a = bool(
-                        st.session_state.get("use_a2a_orchestrator")
-                    ) and _A2A_AVAILABLE
-                    a2a_url = (st.session_state.get("a2a_base_url") or "").strip()
+                    st.session_state["question_answers"] = question_answers
+                    st.session_state["answers_confirmed"] = False
+                    st.session_state["report_content"] = ""
+                    st.session_state["research_complete"] = False
+                    st.success("答案已生成，请检查后确认。")
+        finally:
+            db.close()
 
-                    err: str | None = None
+    if st.session_state.get("question_answers"):
+        st.subheader("Research Results")
+        for i, qa in enumerate(st.session_state["question_answers"], 1):
+            st.markdown(f"### Question {i}")
+            st.markdown(f"**{qa.get('question','')}**")
+            st.markdown(qa.get("answer", ""))
 
-                    if use_a2a:
-                        if not a2a_url:
-                            err = "已启用 A2A，但未填写 Orchestrator Base URL。"
-                        else:
-                            try:
-                                with st.spinner("通过 A2A 调用 Orchestrator…"):
-                                    payload = {
-                                        "uid": uid,
-                                        "topic": topic,
-                                        "domain": domain,
-                                        "stages": stages,
-                                        "force_new": force_new,
-                                        "old_question_ids": old_qids,
-                                        "tavily_api_key": tavily_effective,
-                                    }
-                                    data = _run_orchestrator_via_a2a_sync(a2a_url, payload)
-                                err = data.get("error")
-                                if not err:
-                                    st.session_state.questions = list(
-                                        data.get("questions") or []
-                                    )
-                                    st.session_state.research_question_ids = [
-                                        int(x) for x in (data.get("question_ids") or [])
-                                    ]
-                                    rid = data.get("run_id")
-                                    st.session_state.research_run_id = (
-                                        int(rid) if rid is not None else None
-                                    )
-                                    st.session_state.question_answers = list(
-                                        data.get("question_answers") or []
-                                    )
-                                    st.session_state.report_content = str(
-                                        data.get("report") or ""
-                                    )
-                                    st.session_state.research_complete = bool(
-                                        data.get("research_complete")
-                                    )
-                            except Exception as e:
-                                err = f"A2A 调用失败: {e}"
-                    else:
-                        db = _db()
-                        questions: list[str] = []
-                        q_ids: list[int] = []
-                        run_id: int = 0
-                        question_answers: list[dict] = list(
-                            st.session_state.get("question_answers") or []
+        c7, c8 = st.columns(2)
+        with c7:
+            if st.button("答案无误，确认进入报告阶段", key="confirm_answers_btn"):
+                st.session_state["answers_confirmed"] = True
+                st.success("已确认答案。")
+        with c8:
+            if st.button("答案需重做", key="reject_answers_btn"):
+                st.session_state["answers_confirmed"] = False
+                st.session_state["report_content"] = ""
+                st.session_state["research_complete"] = False
+                st.info("请调整后重新点击“生成答案（Research）”。")
+
+    if not st.session_state.get("answers_confirmed"):
+        return
+
+    st.header("Step 5: 生成最终报告")
+    if st.button("生成报告", type="primary", key="gen_report_btn"):
+        db = _db()
+        try:
+            run_id = st.session_state.get("research_run_id")
+            topic = (st.session_state.get("research_topic") or "").strip()
+            domain = (st.session_state.get("research_domain") or "").strip()
+            qa = list(st.session_state.get("question_answers") or [])
+
+            if not run_id:
+                st.error("缺少 run_id，无法写入报告。")
+            elif not qa:
+                st.error("没有可用于报告的 Q&A。")
+            else:
+                with st.spinner("生成报告中..."):
+                    report, err = research_pipeline.run_report_phase(
+                        llm,
+                        topic,
+                        domain,
+                        qa,
+                        retry_policy,
+                        pipeline_metrics,
+                    )
+                if err:
+                    st.error(f"生成报告失败：{err}")
+                else:
+                    try:
+                        research_repository.upsert_report(
+                            db,
+                            int(run_id),
+                            str(report),
+                            format="markdown",
                         )
+                        db.commit()
+                    except Exception as e:
+                        st.error(f"报告写入数据库失败：{e}")
+                        return
 
-                        try:
-                            for stage in stages:
-                                if stage == "questions":
-                                    qres = research_pipeline.run_questions_phase(
-                                        db,
-                                        uid,
-                                        topic,
-                                        domain,
-                                        force_new=force_new,
-                                        llm=llm,
-                                        settings=settings,
-                                        retry_policy=retry_policy,
-                                        metrics=pipeline_metrics,
-                                        old_question_ids=old_qids,
-                                    )
-                                    if len(qres) == 4:
-                                        err = str(qres[3])
-                                        break
-                                    questions, q_ids, run_id = qres[0], qres[1], qres[2]
-                                    st.session_state.questions = questions
-                                    st.session_state.research_question_ids = q_ids
-                                    st.session_state.research_run_id = run_id
-                                    st.session_state.question_answers = []
-                                    st.session_state.report_content = ""
-                                    st.session_state.research_complete = False
+                    st.session_state["report_content"] = report
+                    st.session_state["research_complete"] = True
+                    st.success("报告已生成。")
+        finally:
+            db.close()
 
-                                elif stage == "research":
-                                    if not questions or not q_ids or not run_id:
-                                        err = "缺少问题列表或 run，无法调研。"
-                                        break
-                                    question_answers, err = research_pipeline.run_research_phase(
-                                        db,
-                                        llm=llm,
-                                        topic=topic,
-                                        domain=domain,
-                                        questions=questions,
-                                        q_ids=q_ids,
-                                        run_id=run_id,
-                                        retry_policy=retry_policy,
-                                        metrics=pipeline_metrics,
-                                        tavily_api_key=tavily_effective,
-                                        settings=settings,
-                                    )
-                                    if err:
-                                        break
-                                    st.session_state.question_answers = question_answers
-
-                                elif stage == "report":
-                                    qa = list(
-                                        st.session_state.get("question_answers")
-                                        or question_answers
-                                    )
-                                    if not qa:
-                                        err = "没有 Q&A，无法生成报告。"
-                                        break
-                                    report, err = research_pipeline.run_report_phase(
-                                        llm,
-                                        topic,
-                                        domain,
-                                        qa,
-                                        retry_policy,
-                                        pipeline_metrics,
-                                    )
-                                    if err:
-                                        break
-
-                                    # 关键：写入 research_report（需要你在 repo 中实现 upsert_report）
-                                    try:
-                                        research_repository.upsert_report(
-                                            db,
-                                            int(run_id),
-                                            str(report),
-                                            format="markdown",
-                                        )
-                                        db.commit()
-                                    except Exception as e:
-                                        err = f"报告写入数据库失败: {e}"
-                                        break
-
-                                    st.session_state.report_content = report
-                                    st.session_state.research_complete = True
-                        finally:
-                            db.close()
-
-                    st.session_state.pipeline_last_error = err or ""
-                    st.session_state.bypass_questions_cache = False
-                    st.session_state.routed_intent = ""
-
-                    if err:
-                        st.error(f"流水线中断：{err}")
-                    else:
-                        mode = "A2A-Orchestrator" if use_a2a else "in-process"
-                        st.success(f"完成（{mode}）。意图={decision.intent}，执行阶段={stages}")
-                        if decision.reply_to_user:
-                            st.caption(decision.reply_to_user)
+    if st.session_state.get("research_complete") and st.session_state.get("report_content"):
+        st.header("Final Report")
+        with st.expander("View Full Report Content", expanded=True):
+            st.markdown(st.session_state["report_content"])
 
     if st.session_state.get("pipeline_last_error"):
         with st.expander("上次流水线错误", expanded=False):
@@ -582,24 +591,6 @@ def render_research_app() -> None:
         with st.expander("上次路由摘要", expanded=False):
             st.write(f"intent: {st.session_state.get('routed_intent', '')}")
             st.write(st.session_state.get("last_router_message", ""))
-
-    if st.session_state.questions:
-        st.header("Research Questions")
-        for i, question in enumerate(st.session_state.questions):
-            st.markdown(f"**{i + 1}. {question}**")
-
-    if st.session_state.get("question_answers"):
-        st.header("Research Results")
-        for i, qa in enumerate(st.session_state.question_answers):
-            st.subheader(f"Question {i + 1}")
-            st.markdown(f"**{qa['question']}**")
-            st.markdown(qa.get("answer", ""))
-
-    if st.session_state.research_complete and st.session_state.report_content:
-        st.header("Final Report")
-        st.success("Your report has been compiled.")
-        with st.expander("View Full Report Content", expanded=True):
-            st.markdown(st.session_state.report_content)
 
 
 def render_streamlit_app() -> None:
