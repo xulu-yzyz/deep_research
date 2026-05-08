@@ -12,7 +12,7 @@ from app.core.resilience import PipelineMetrics, RetryPolicy
 from app.db.session import SessionLocal
 from app.integrations.llm_client import build_llm
 from app.memory import memory_tools
-from app.memory.memory_planner import decide_memory
+from app.integrations.memory_agent_run import run_memory_commit_with_tools
 
 
 def _extract_preferences_from_memories(recall_items: list[dict]) -> dict:
@@ -119,10 +119,15 @@ def _run_pipeline_blocking(payload: dict) -> dict:
 
     db = SessionLocal()
     try:
-        questions: list[str] = []
-        q_ids: list[int] = []
-        run_id: int = 0
-        question_answers: list[dict] = []
+        questions: list[str] = [str(x).strip() for x in payload.get("questions") or [] if str(x).strip()]
+        q_ids: list[int] = [int(x) for x in payload.get("question_ids") or []]
+        run_id: int = int(payload.get("run_id") or 0)
+        question_answers: list[dict] = list(payload.get("question_answers") or [])
+
+        out["questions"] = questions
+        out["question_ids"] = q_ids
+        out["run_id"] = run_id or None
+        out["question_answers"] = question_answers
 
         
         recall = memory_tools.search_user_memory(
@@ -260,13 +265,9 @@ def _run_pipeline_blocking(payload: dict) -> dict:
                     )
                     
 
-                    plan = decide_memory(llm_for_memory, planner_input)
-                    memories = list(plan.get("memories") or [])
-                    if plan.get("should_save") and memories:
-                        res = memory_tools.save_user_memories(user_id=uid, memories=memories)
-                        out["memory_commit"] = {"ok": res.ok, "data": res.data, "error": res.error}
-                    else:
-                        out["memory_commit"] = {"ok": True, "skipped": True, "reason": "planner:no_save"}
+                    out["memory_commit"] = run_memory_commit_with_tools(
+                        llm_for_memory, uid, planner_input
+                    )
                 except Exception as e:
                     out["memory_commit"] = {"ok": False, "error": str(e)}
 

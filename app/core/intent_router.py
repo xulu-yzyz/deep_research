@@ -14,9 +14,6 @@ from app.integrations.lc_run import run_llm_text
 VALID_INTENTS = frozenset(
     {
         "full_research", #用户想开始做深度调研
-        "regenerate_questions", #用户想重新生成问题
-        "report_only",
-        "quick_answer", #用户想快速回答一个问题,无需搜索
         "off_topic", #用户想回答一个与主题无关的问题,无需搜索
         "clarify", #信息不够抽 topic+domain
     }
@@ -63,12 +60,6 @@ def decision_from_payload(data: dict[str, Any], session_context: dict[str, Any])
     prev_domain = str(session_context.get("research_domain", "")).strip()
 
 
-
-    if intent in ("regenerate_questions", "report_only"):
-        if not topic:
-            topic = prev_topic
-        if not domain:
-            domain = prev_domain
     
     # STM-1: 用户只改「领域」或只改「主题」时，模型可能只填一侧；用会话快照补全另一侧。
     if intent == "full_research":
@@ -76,9 +67,6 @@ def decision_from_payload(data: dict[str, Any], session_context: dict[str, Any])
             topic = prev_topic
         if not domain:
             domain = prev_domain
-
-    if intent == "quick_answer":
-        need_web = bool(data.get("need_web_search", False))
 
     if intent in ("full_research", "regenerate_questions", "quick_answer") and (not topic or not domain):
         if not clarify:

@@ -19,47 +19,6 @@ class LlmRoleAgent:
         return run_llm_text(llm, system, user)
 
 
-class QuestionGeneratorAgent(LlmRoleAgent):
-    """角色 1：把 topic + domain 变成若干研究问题。"""
-
-    def __init__(self) -> None:
-        super().__init__("QuestionGenerator")
-
-    def run(self, llm: ChatOpenAI, topic: str, domain: str) -> str:
-        system = agent_prompts.question_generator_system()
-        user = agent_prompts.question_generator_user(topic, domain)
-        print("This is QuestionGeneratorAgent")
-        return self._invoke_text(llm, system, user)
-
-
-# 在文件顶部增加类型与函数导入
-from langchain_core.tools import BaseTool
-
-from app.integrations.research_agent_run import run_research_with_tools
-
-
-class ResearchRoleAgent(LlmRoleAgent):
-    def __init__(self) -> None:
-        super().__init__("Researcher")
-
-    def run(
-        self,
-        llm: ChatOpenAI,
-        topic: str,
-        domain: str,
-        question: str,
-        tools: list[BaseTool] | None = None,
-    ) -> str:
-        system = agent_prompts.research_agent_system(topic, domain, question)
-        user = agent_prompts.research_agent_user(topic, domain, question)
-
-        if tools:
-            return run_research_with_tools(llm, tools, system, user)
-
-        return self._invoke_text(llm, system, user)
-        
-        
-
 
 class ReportRoleAgent(LlmRoleAgent):
     def __init__(self) -> None:
@@ -88,11 +47,3 @@ class ReportRoleAgent(LlmRoleAgent):
         user = agent_prompts.report_agent_user(topic, domain)
         return self._invoke_text(llm, system, user)
 
-
-def default_agents() -> tuple[QuestionGeneratorAgent, ResearchRoleAgent, ReportRoleAgent]:
-    """流水线里用的默认三个协作角色；以后要换实现可以只改这个工厂。"""
-    return (
-        QuestionGeneratorAgent(),
-        ResearchRoleAgent(),
-        ReportRoleAgent(),
-    )

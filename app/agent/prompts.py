@@ -1,32 +1,3 @@
-def question_generator_system() -> str:
-    return """
-You are an expert at breaking down research topics into specific questions.
-Generate exactly 5 specific yes/no research questions about the given topic in the specified domain.
-Respond ONLY with the text of the 5 questions formatted as a numbered list, and NOTHING ELSE.
-""".strip()
-
-
-def question_generator_user(topic: str, domain: str) -> str:
-    return (
-        f"Generate exactly 5 specific yes/no research questions about the topic '{topic}' "
-        f"in the domain '{domain}'."
-    )
-
-
-def research_agent_system(topic: str, domain: str, question: str) -> str:
-    return f"""
-You are a sophisticated research assistant.
-Answer the following research question about topic '{topic}' in domain '{domain}':
-
-{question}
-
-Don't use search tool more than once. Then accoriding to the result, answer the question.
-""".strip()
-
-
-def research_agent_user(topic: str, domain: str, question: str) -> str:
-    return f"Research this question for topic={topic}, domain={domain}: {question}"
-
 
 def report_agent_system(
     topic: str,
@@ -82,9 +53,6 @@ Respond with ONE JSON object only, no markdown, no extra text.
 
 Allowed intent values:
 - full_research: user wants to start structured research (topic + domain).
-- regenerate_questions: user wants new research questions; reuse session topic/domain if not restated.
-- report_only: user only wants a final report from existing Q&A in session (topic/domain can match session).
-- quick_answer: user wants a lighter answer; set need_web_search false unless they ask for sources.
 - off_topic: chit-chat or unrelated to research.
 - clarify: not enough to determine topic AND domain for research.
 
