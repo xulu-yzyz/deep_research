@@ -5,7 +5,7 @@ from langchain_openai import ChatOpenAI
 
 from app.core.research_state import ResearchState, ResearchTask
 from app.integrations.lc_run import run_llm_text
-
+from app.core.working_memory import compact_for_prompt
 
 def _system_prompt() -> str:
     return """
@@ -30,7 +30,10 @@ Schema:
 
 def _user_prompt(state: ResearchState) -> str:
     completed = "\n\n".join(
-        f"Question: {t.question}\nAnswer: {t.answer}"
+        f"Question: {t.question}\n"
+        f"Answer: {t.answer}\n"
+        f"Confidence: {t.confidence}\n"
+        f"Evidence count: {len(t.evidence)}"
         for t in state.tasks
         if t.status == "done"
     )
@@ -44,6 +47,9 @@ Plan:
 
 Completed research:
 {completed}
+
+Short-term working memory:
+{compact_for_prompt(state.working_memory)}
 """.strip()
 
 

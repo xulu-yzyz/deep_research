@@ -5,7 +5,7 @@ from langchain_openai import ChatOpenAI
 
 from app.integrations.lc_run import run_llm_text
 from app.core.research_state import ResearchState, ResearchTask
-
+from app.core.working_memory import compact_for_prompt
 
 def _system_prompt() -> str:
     return """
@@ -35,6 +35,8 @@ Rules:
 
 
 def _user_prompt(state: ResearchState) -> str:
+    wm_context = compact_for_prompt(state.working_memory)
+
     return f"""
 User request:
 {state.user_request}
@@ -45,10 +47,15 @@ Topic:
 Domain:
 {state.domain}
 
-User memory/preferences:
+Persistent user memory/preferences:
 {state.memory_context}
-""".strip()
 
+Short-term working memory:
+{wm_context}
+
+Current session constraints:
+{state.session_constraints}
+""".strip()
 
 class ResearchPlannerAgent:
     def run(self, llm: ChatOpenAI, state: ResearchState) -> ResearchState:

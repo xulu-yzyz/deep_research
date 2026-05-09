@@ -9,7 +9,7 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
-
+import traceback
 
 def mount_json_invoke_routes(handler: Callable[[dict[str, Any]], dict[str, Any]]) -> list[Route]:
     async def invoke(request: Request) -> JSONResponse:
@@ -22,6 +22,7 @@ def mount_json_invoke_routes(handler: Callable[[dict[str, Any]], dict[str, Any]]
         try:
             out = await asyncio.to_thread(handler, body)
         except Exception as e:
+            traceback.print_exc()
             return JSONResponse({"error": str(e)}, status_code=500)
         return JSONResponse(out)
 

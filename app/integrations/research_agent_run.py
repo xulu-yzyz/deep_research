@@ -27,7 +27,7 @@ def _log_agent_messages(messages: list) -> None:
             name = getattr(m, "name", "?")
             body = m.content or ""
             preview = body[:300] + ("..." if len(body) > 300 else "")
-            print(f"    ← tool_result: {name!r} preview={preview!r}")
+            print(f"    ← 工具调用: {name!r} 预览={preview!r}")
 
 
 def run_research_with_tools(

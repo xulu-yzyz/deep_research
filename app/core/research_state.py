@@ -25,7 +25,7 @@ class ResearchTask:
     answer: str = ""
     evidence: list[Evidence] = field(default_factory=list)
     confidence: float = 0.0
-
+    observations: list[dict[str, Any]] = field(default_factory=list)
 
 @dataclass
 class ResearchState:
@@ -44,6 +44,9 @@ class ResearchState:
 
     iteration: int = 0
     max_iterations: int = 8
+
+    working_memory: dict[str, Any] = field(default_factory=dict)
+    session_constraints: dict[str, Any] = field(default_factory=dict)
 
     def pending_tasks(self) -> list[ResearchTask]:
         return [t for t in self.tasks if t.status == "pending"]

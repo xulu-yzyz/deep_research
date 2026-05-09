@@ -11,7 +11,11 @@ from app.core.stm_router_context import prepare_stm_router_context
 from app.db import research_repository
 from app.db.session import SessionLocal
 from app.integrations.llm_client import build_llm
-
+from app.core.working_memory import empty_working_memory
+import re
+import subprocess
+import sys
+from pathlib import Path
 try:
     import httpx  # noqa: F401
     from app.a2a.a2a_json_client import send_json_message
@@ -96,6 +100,14 @@ def init_session_state() -> None:
     st.session_state.setdefault("questions_confirmed", False)
     st.session_state.setdefault("answers_confirmed", False)
 
+    st.session_state.setdefault("agent_working_memory", empty_working_memory())
+
+    st.session_state.setdefault("rag_enabled", False)
+    st.session_state.setdefault("rag_persist_directory", ".rag/chroma")
+    st.session_state.setdefault("rag_collection_name", "research_docs")
+    st.session_state.setdefault("rag_docs_dir", "docs/rag")
+    st.session_state.setdefault("rag_last_index_output", "")
+
 
 async def _call_orchestrator(base_url: str, payload: dict) -> dict:
     return await send_json_message(base_url.rstrip("/"), payload)
@@ -112,6 +124,61 @@ def _invoke_orchestrator(base_url: str, payload: dict, spinner_text: str) -> dic
         return {"error": "A2A Base URL is empty."}
     with st.spinner(spinner_text):
         return _run_orchestrator_via_a2a_sync(base_url, payload)
+
+def _safe_slug(value: str, fallback: str = "default") -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", (value or "").strip()).strip("_")
+    return slug or fallback
+
+
+def _rag_paths_for_user(uid: int, domain: str) -> tuple[str, str, str]:
+    domain_slug = _safe_slug(domain, "general")
+    docs_dir = f"docs/rag/{uid}/{domain_slug}"
+    persist_dir = ".rag/chroma"
+    collection = f"research_docs_{uid}_{domain_slug}"
+    return docs_dir, persist_dir, collection
+
+
+def _save_uploaded_rag_files(uploaded_files: list, docs_dir: str) -> list[str]:
+    target_dir = Path(docs_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: list[str] = []
+    for file in uploaded_files:
+        safe_name = _safe_slug(Path(file.name).stem, "document") + Path(file.name).suffix.lower()
+        target_path = target_dir / safe_name
+        target_path.write_bytes(file.getbuffer())
+        saved.append(str(target_path))
+
+    return saved
+
+
+def _index_rag_documents(docs_dir: str, persist_dir: str, collection: str, domain: str) -> tuple[bool, str]:
+    project_root = Path(__file__).resolve().parents[2]
+    script_path = project_root / "app" / "rag" / "index_rag_documents.py"
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--docs-dir",
+        docs_dir,
+        "--persist-dir",
+        persist_dir,
+        "--collection",
+        collection,
+        "--domain",
+        domain,
+    ]
+
+    result = subprocess.run(
+        cmd,
+        cwd=str(project_root),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    output = "\n".join(x for x in [result.stdout, result.stderr] if x.strip()).strip()
+    return result.returncode == 0, output
 
 
 def _sync_stage_result_to_session(data: dict) -> None:
@@ -135,6 +202,9 @@ def _sync_stage_result_to_session(data: dict) -> None:
         st.session_state["report_content"] = str(data.get("report") or "")
     if "research_complete" in data:
         st.session_state["research_complete"] = bool(data.get("research_complete"))
+
+    if "working_memory" in data:
+            st.session_state["agent_working_memory"] = data["working_memory"]
 
 
 def render_auth_sidebar() -> None:
@@ -315,6 +385,55 @@ def render_research_app() -> None:
         value=settings.tavily_api_key,
         type="password",
     )
+    uid = int(st.session_state["user_id"])
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### RAG Knowledge Base")
+
+    current_domain = st.session_state.get("research_domain", "")
+    rag_docs_dir, rag_persist_dir, rag_collection = _rag_paths_for_user(uid, current_domain)
+
+    st.session_state["rag_docs_dir"] = rag_docs_dir
+    st.session_state["rag_persist_directory"] = rag_persist_dir
+    st.session_state["rag_collection_name"] = rag_collection
+
+    st.sidebar.checkbox("Enable RAG", key="rag_enabled")
+
+    uploaded_rag_files = st.sidebar.file_uploader(
+        "Upload RAG documents",
+        type=["pdf", "txt", "md"],
+        accept_multiple_files=True,
+        help="上传后点击 Build / Update RAG Index，文档会被切块并写入本地 Chroma 向量库。",
+    )
+
+    st.sidebar.caption(f"Docs dir: `{rag_docs_dir}`")
+    st.sidebar.caption(f"Collection: `{rag_collection}`")
+
+    if st.sidebar.button("Build / Update RAG Index", key="build_rag_index"):
+        if not uploaded_rag_files:
+            st.sidebar.warning("请先上传 PDF / TXT / MD 文件。")
+        else:
+            try:
+                saved = _save_uploaded_rag_files(uploaded_rag_files, rag_docs_dir)
+                ok, output = _index_rag_documents(
+                    docs_dir=rag_docs_dir,
+                    persist_dir=rag_persist_dir,
+                    collection=rag_collection,
+                    domain=current_domain or "general",
+                )
+                st.session_state["rag_last_index_output"] = output
+
+                if ok:
+                    st.sidebar.success(f"RAG index built. Saved {len(saved)} file(s).")
+                    
+                else:
+                    st.sidebar.error("RAG indexing failed.")
+            except Exception as e:
+                st.session_state["rag_last_index_output"] = str(e)
+                st.sidebar.error(f"RAG indexing failed: {e}")
+
+    if st.session_state.get("rag_last_index_output"):
+        with st.sidebar.expander("RAG indexing output", expanded=False):
+            st.code(st.session_state["rag_last_index_output"])
 
     redis_ok = get_redis_client() is not None
     st.sidebar.caption(f"Redis cache: {'connected' if redis_ok else 'off / unavailable'}")
@@ -344,7 +463,7 @@ def render_research_app() -> None:
         base_url=settings.deepseek_base_url,
     )
 
-    uid = int(st.session_state["user_id"])
+    
     _render_history_restore_panel(uid)
 
     st.header("Step 0: 输入需求")
@@ -381,7 +500,13 @@ def render_research_app() -> None:
             )
             st.session_state["stm_dialogue_summary"] = summ2
             decision, _ = route_user_message(llm, raw, ctx, retry_policy, pipeline_metrics)
-
+            assistant_summary = (
+                f"intent={decision.intent}; "
+                f"topic={decision.topic}; "
+                f"domain={decision.domain}; "
+                f"message={decision.reply_to_user or decision.clarify_prompt}"
+            )
+            _append_stm_turn("assistant", assistant_summary)
             st.session_state["routed_intent"] = decision.intent
             st.session_state["use_web_search"] = decision.need_web_search
             st.session_state["last_router_message"] = decision.reply_to_user or ""
@@ -436,139 +561,31 @@ def render_research_app() -> None:
     if not st.session_state.get("topic_domain_confirmed"):
         st.info("请先确认 topic/domain。")
         return
+    st.header("Step 3: Agentic Deep Research")
 
-    st.header("Step 3: 通过 Orchestrator 生成并确认问题")
-    if st.button("生成问题（A2A）", key="gen_questions_a2a"):
+    if st.button("开始智能调研", type="primary", key="run_agentic_research"):
         payload = {
             "uid": uid,
             "topic": (st.session_state.get("research_topic") or "").strip(),
             "domain": (st.session_state.get("research_domain") or "").strip(),
-            "stages": ["questions"],
-            "force_new": True,
-            "old_question_ids": [
-                int(x) for x in (st.session_state.get("research_question_ids") or [])
-            ],
-            "tavily_api_key": (tavily_key or "").strip() or None,
+            "stages": ["agentic_research", "memory_commit"],
+            # "tavily_api_key": (tavily_key or "").strip() or None,
+            "tavily_api_key": None,
             "user_request": st.session_state.get("user_request", ""),
+            "working_memory": st.session_state.get("agent_working_memory") or {},
+            "rag_enabled": bool(st.session_state.get("rag_enabled")),
+            "rag_persist_directory": st.session_state.get("rag_persist_directory") or ".rag/chroma",
+            "rag_collection_name": st.session_state.get("rag_collection_name") or "research_docs",
         }
         data = _invoke_orchestrator(
             st.session_state.get("a2a_base_url", ""),
             payload,
-            "通过 A2A orchestrator 生成问题...",
+            "Agent 正在规划、调研、反思并生成报告...",
         )
+        
         _sync_stage_result_to_session(data)
-        if data.get("error"):
-            st.error(f"生成问题失败：{data.get('error')}")
-        else:
-            st.session_state["questions_confirmed"] = False
-            _reset_after_questions_change()
-            st.success("问题已生成，请确认。")
-
-    if st.session_state.get("questions"):
-        for i, q in enumerate(st.session_state["questions"], 1):
-            st.markdown(f"**{i}. {q}**")
-
-        c5, c6 = st.columns(2)
-        with c5:
-            if st.button("确认这些问题", key="confirm_questions"):
-                st.session_state["questions_confirmed"] = True
-                st.success("问题已确认。")
-        with c6:
-            if st.button("问题不合适，重新生成", key="regen_questions"):
-                st.session_state["questions_confirmed"] = False
-                _reset_after_questions_change()
-                st.info("请再次点击“生成问题（A2A）”。")
-    else:
-        st.info("尚未生成问题。")
-
-    if not st.session_state.get("questions_confirmed"):
-        return
-
-    st.header("Step 4: 用户同意后，通过 Orchestrator 生成答案")
-    if st.button("生成答案（A2A）", type="primary", key="gen_answers_a2a"):
-        payload = {
-            "uid": uid,
-            "topic": (st.session_state.get("research_topic") or "").strip(),
-            "domain": (st.session_state.get("research_domain") or "").strip(),
-            "stages": ["research"],
-            "force_new": False,
-            "old_question_ids": [],
-            "tavily_api_key": (tavily_key or "").strip() or None,
-            # For strict staged A2A, pass intermediate artifacts back
-            "run_id": st.session_state.get("research_run_id"),
-            "questions": list(st.session_state.get("questions") or []),
-            "question_ids": [
-                int(x) for x in (st.session_state.get("research_question_ids") or [])
-            ],
-            "user_request": st.session_state.get("user_request", ""),
-        }
-        data = _invoke_orchestrator(
-            st.session_state.get("a2a_base_url", ""),
-            payload,
-            "通过 A2A orchestrator 生成答案...",
-        )
-        _sync_stage_result_to_session(data)
-        if data.get("error"):
-            st.error(f"生成答案失败：{data.get('error')}")
-        else:
-            st.session_state["answers_confirmed"] = False
-            st.session_state["report_content"] = ""
-            st.session_state["research_complete"] = False
-            st.success("答案已生成，请检查并确认。")
-
-    if st.session_state.get("question_answers"):
-        st.subheader("Research Results")
-        for i, qa in enumerate(st.session_state["question_answers"], 1):
-            st.markdown(f"### Question {i}")
-            st.markdown(f"**{qa.get('question', '')}**")
-            st.markdown(qa.get("answer", ""))
-
-        c7, c8 = st.columns(2)
-        with c7:
-            if st.button("答案无误，进入报告阶段", key="confirm_answers"):
-                st.session_state["answers_confirmed"] = True
-                st.success("已确认答案。")
-        with c8:
-            if st.button("答案需要重做", key="redo_answers"):
-                st.session_state["answers_confirmed"] = False
-                st.session_state["report_content"] = ""
-                st.session_state["research_complete"] = False
-                st.info("请再次点击“生成答案（A2A）”。")
-    else:
-        st.info("尚未生成答案。")
-
-    if not st.session_state.get("answers_confirmed"):
-        return
-
-    st.header("Step 5: 通过 Orchestrator 生成报告")
-    if st.button("生成报告（A2A）", type="primary", key="gen_report_a2a"):
-        payload = {
-            "uid": uid,
-            "topic": (st.session_state.get("research_topic") or "").strip(),
-            "domain": (st.session_state.get("research_domain") or "").strip(),
-            "stages": ["report", "memory_commit"],
-            "force_new": False,
-            "old_question_ids": [],
-            "run_id": st.session_state.get("research_run_id"),
-            "question_answers": list(st.session_state.get("question_answers") or []),
-            "user_request": st.session_state.get("user_request", ""),
-        }
-        data = _invoke_orchestrator(
-            st.session_state.get("a2a_base_url", ""),
-            payload,
-            "通过 A2A orchestrator 生成报告...",
-        )
-        _sync_stage_result_to_session(data)
-        if data.get("error"):
-            st.error(f"生成报告失败：{data.get('error')}")
-        else:
-            st.success("报告已生成。")
-            mc = data.get("memory_commit")
-            if isinstance(mc, dict):
-                if mc.get("ok"):
-                    st.caption("memory_commit: ok")
-                else:
-                    st.caption(f"memory_commit: {mc}")
+    
+    
 
     if st.session_state.get("research_complete") and st.session_state.get("report_content"):
         st.header("Final Report")
